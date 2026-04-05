@@ -116,7 +116,7 @@ public class PixelCanvas : MonoBehaviour
 
         rawImage.texture = tex;
 
-        // SCALEFACTOR FIX ó 1:1 ekran piksel e˛lemesi
+        // SCALEFACTOR FIX ù 1:1 ekran piksel eùlemesi
         float scale = parentCanvas != null ? parentCanvas.scaleFactor : 1f;
         rt.sizeDelta = new Vector2(width / scale, height / scale);
         rt.pivot = new Vector2(0.5f, 0.5f);
@@ -129,7 +129,7 @@ public class PixelCanvas : MonoBehaviour
         // decrement ignore pointer frames if set
         if (ignorePointerFrames > 0) ignorePointerFrames--;
 
-        // Klavye k˝sayollar˝ (Ctrl/Cmd+Z, Ctrl/Cmd+Y)
+        // Klavye kùsayollarù (Ctrl/Cmd+Z, Ctrl/Cmd+Y)
         bool ctrl = Input.GetKey(KeyCode.LeftControl) || Input.GetKey(KeyCode.RightControl)
                     || Input.GetKey(KeyCode.LeftCommand) || Input.GetKey(KeyCode.RightCommand);
 
@@ -147,10 +147,10 @@ public class PixelCanvas : MonoBehaviour
             ClearSelectedUINextFrame();
         }
 
-        // --- Move (pan) ba˛lang˝c˝ ---
+        // --- Move (pan) baùlangùcù ---
         if (currentMode == Mode.Move)
         {
-            // Ba˛lang˝Á: mouse down ise ve pointer canvas'˝n ¸zerinde ise panning ba˛lat
+            // Baùlangùù: mouse down ise ve pointer canvas'ùn ùzerinde ise panning baùlat
             if (Input.GetMouseButtonDown(0) && ignorePointerFrames == 0 && IsPointerOverCanvasTexture())
             {
                 Camera cam = parentCanvas != null ? parentCanvas.worldCamera : null;
@@ -163,7 +163,7 @@ public class PixelCanvas : MonoBehaviour
                 }
             }
 
-            // Panning devam˝: mouse held
+            // Panning devamù: mouse held
             if (isPanning && Input.GetMouseButton(0))
             {
                 Camera cam = parentCanvas != null ? parentCanvas.worldCamera : null;
@@ -178,7 +178,7 @@ public class PixelCanvas : MonoBehaviour
                 }
             }
 
-            // Panning biti˛i
+            // Panning bitiùi
             if (isPanning && Input.GetMouseButtonUp(0))
             {
                 isPanning = false;
@@ -384,10 +384,20 @@ public class PixelCanvas : MonoBehaviour
 
     void FillBackgroundPattern()
     {
+        FillBackgroundInto(pixelBuffer);
+    }
+
+    /// <summary>
+    /// Arka plan desenini (damal? / dùz / ?zgara ùizgisi) verilen tam boyutlu diziye yazar.
+    /// </summary>
+    public void FillBackgroundInto(Color32[] buffer)
+    {
+        if (buffer == null || buffer.Length != width * height) return;
+
         if (!showCheckerboard)
         {
-            for (int i = 0; i < pixelBuffer.Length; i++)
-                pixelBuffer[i] = bgColorA;
+            for (int i = 0; i < buffer.Length; i++)
+                buffer[i] = bgColorA;
             return;
         }
 
@@ -407,12 +417,12 @@ public class PixelCanvas : MonoBehaviour
                     int modY = y % tileSize;
                     if (modX < gridLineWidth || modY < gridLineWidth)
                     {
-                        pixelBuffer[row + x] = gridLineColor;
+                        buffer[row + x] = gridLineColor;
                         continue;
                     }
                 }
 
-                pixelBuffer[row + x] = baseCol;
+                buffer[row + x] = baseCol;
             }
         }
     }
@@ -926,7 +936,7 @@ public class PixelCanvas : MonoBehaviour
     }
 
     /// <summary>
-    /// Export pixel list as compact JSON object (array of {x,y,color}) ó useful if model expects JSON.
+    /// Export pixel list as compact JSON object (array of {x,y,color}) ù useful if model expects JSON.
     /// </summary>
     public string ExportFullPixelListAsJson(bool includeBackground = false, bool useCropIfPossible = true, int maxPixels = 8192)
     {
@@ -1360,6 +1370,58 @@ public class PixelCanvas : MonoBehaviour
     }
     // Example ColorsEqual helper (kept)
     // (Also BeginAction/RecordChange/EndAction/Undo/Redo are present above and used by these methods.)
+
+    // ---- Proje / katman API ----
+
+    /// <summary>Boyut veya arka plan ayar? de?i?ince dokuyu ba?tan olu?turur; geùmi?i temizler.</summary>
+    public void RebuildTexture()
+    {
+        CreateTexture();
+        ClearHistory();
+    }
+
+    /// <summary>Geri al / yinele y???nlar?n? temizler.</summary>
+    public void ClearHistory()
+    {
+        undoStack.Clear();
+        redoStack.Clear();
+        currentAction = null;
+        currentActionSet = null;
+        NotifyHistoryChanged();
+    }
+
+    /// <summary>Mevcut tuval piksellerinin kopyas?n? dùndùrùr.</summary>
+    public Color32[] ClonePixelBuffer()
+    {
+        if (pixelBuffer == null) return null;
+        var c = new Color32[pixelBuffer.Length];
+        Array.Copy(pixelBuffer, c, pixelBuffer.Length);
+        return c;
+    }
+
+    /// <summary>Sadece arka plan desenine gùre dolu bir tampon (yeni katman iùin).</summary>
+    public Color32[] CreateBackgroundBufferCopy()
+    {
+        var buf = new Color32[width * height];
+        FillBackgroundInto(buf);
+        return buf;
+    }
+
+    /// <summary>Piksel tamponunu de?i?tirir ve dokuyu gùnceller.</summary>
+    public void ReplacePixelsFrom(Color32[] src)
+    {
+        if (src == null || pixelBuffer == null || src.Length != pixelBuffer.Length)
+        {
+            Debug.LogWarning("[PixelCanvas] ReplacePixelsFrom: boyut uyu?muyor.");
+            return;
+        }
+
+        Array.Copy(src, pixelBuffer, src.Length);
+        tex.SetPixels32(pixelBuffer);
+        tex.Apply();
+        dirty = false;
+        ClearHistory();
+    }
 
     // ---- end of file ----
 }
