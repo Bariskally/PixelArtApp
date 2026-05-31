@@ -26,6 +26,10 @@ public class ChatManager : MonoBehaviour
     [Header("Integration hooks")]
     public RuntimeColorPaletteController runtimePaletteController; // inspector baðla ya da null býrak
 
+    [Header("Model")]
+    [Tooltip("OpenRouter model ID. Þu an deepseek/deepseek-v4-flash:free kullanýlýyor.")]
+    public string modelName = "deepseek/deepseek-v4-flash:free";
+
     [Header("System prompt (optional)")]
     [Tooltip("If true, the systemMessage will be sent as a system role to the model before the user's prompt.")]
     public bool includeSystemMessage = true;
@@ -73,7 +77,7 @@ public class ChatManager : MonoBehaviour
 
         var body = new Dictionary<string, object>()
         {
-            { "model", "openrouter/healer-alpha" },
+            { "model", modelName },
             { "messages", messagesList.ToArray() },
             { "max_tokens", 300 }
         };
@@ -209,7 +213,7 @@ public class ChatManager : MonoBehaviour
 
             var body = new Dictionary<string, object>()
             {
-                { "model", "openrouter/healer-alpha" },
+                { "model", modelName },
                 { "messages", messagesList.ToArray() },
                 { "max_tokens", maxTokens }
             };

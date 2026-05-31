@@ -1,5 +1,6 @@
-using UnityEngine;
+Ôªøusing UnityEngine;
 using UnityEngine.UI;
+using UnityEngine.EventSystems; // EventSystem i√ßin eklendi
 using System;
 
 public class ToolPanelController : MonoBehaviour
@@ -8,17 +9,18 @@ public class ToolPanelController : MonoBehaviour
     public Button penButton;
     public Button eraserButton;
     public Button bucketButton;
-    public Button moveButton; // yeni
+    public Button moveButton;
+    public Button selectButton;   // ‚Üê Select butonu referansƒ±
 
-    [Header("Undo/Redo Buttons (these are momentary and managed separately)")]
-    public Button undoButton; // referans sadece interactable g¸ncellemesi iÁin
-    public Button redoButton; // referans sadece interactable g¸ncellemesi iÁin
+    [Header("Undo/Redo Buttons")]
+    public Button undoButton;
+    public Button redoButton;
 
     [Header("References")]
     public PixelCanvas pixelCanvas;
 
     [Header("Visuals")]
-    public Color selectedColor = new Color(0.2f, 0.6f, 1f, 1f); // seÁili araÁ rengi
+    public Color selectedColor = new Color(0.2f, 0.6f, 1f, 1f);
     public Color normalColor = Color.white;
 
     void Start()
@@ -26,18 +28,10 @@ public class ToolPanelController : MonoBehaviour
         if (pixelCanvas == null)
             Debug.LogWarning("ToolPanelController: pixelCanvas not assigned.");
 
-        // default selection: none
         UpdateSelectionVisuals(null);
-
-        if (pixelCanvas != null) pixelCanvas.SetModePen(); // default internal tool mode; visual none
-
-        // subscribe to history change event so we update undo/redo interactables only when needed
+        if (pixelCanvas != null) pixelCanvas.SetModePen();
         if (pixelCanvas != null) pixelCanvas.OnHistoryChanged += UpdateUndoRedoInteractable;
-
-        // initial update
         UpdateUndoRedoInteractable();
-
-        // ensure no UI element shows as selected (clears keyboard focus highlight)
         if (pixelCanvas != null) pixelCanvas.ClearSelectedUIImmediate();
     }
 
@@ -46,7 +40,6 @@ public class ToolPanelController : MonoBehaviour
         if (pixelCanvas != null) pixelCanvas.OnHistoryChanged -= UpdateUndoRedoInteractable;
     }
 
-    // These are called by helper button scripts or can be wired directly; they manage mode + visuals.
     public void OnPenPressed()
     {
         if (pixelCanvas != null)
@@ -55,7 +48,6 @@ public class ToolPanelController : MonoBehaviour
             pixelCanvas.IgnorePointerForOneFrame();
             pixelCanvas.ClearSelectedUINextFrame();
         }
-
         UpdateSelectionVisuals(penButton);
     }
 
@@ -67,7 +59,6 @@ public class ToolPanelController : MonoBehaviour
             pixelCanvas.IgnorePointerForOneFrame();
             pixelCanvas.ClearSelectedUINextFrame();
         }
-
         UpdateSelectionVisuals(eraserButton);
     }
 
@@ -79,7 +70,6 @@ public class ToolPanelController : MonoBehaviour
             pixelCanvas.IgnorePointerForOneFrame();
             pixelCanvas.ClearSelectedUINextFrame();
         }
-
         UpdateSelectionVisuals(bucketButton);
     }
 
@@ -91,46 +81,44 @@ public class ToolPanelController : MonoBehaviour
             pixelCanvas.IgnorePointerForOneFrame();
             pixelCanvas.ClearSelectedUINextFrame();
         }
-
         UpdateSelectionVisuals(moveButton);
     }
 
-    // Undo/Redo are handled by separate UndoButton/RedoButton scripts.
-    // This function only updates the visuals of tool buttons (pen/eraser/bucket/move)
-    void UpdateSelectionVisuals(Button selected)
+    public void OnSelectPressed()
     {
-        if (penButton != null)
+        if (pixelCanvas != null)
         {
-            var img = penButton.GetComponent<Image>();
-            if (img != null) img.color = (penButton == selected) ? selectedColor : normalColor;
+            pixelCanvas.SetModeSelect();
+            pixelCanvas.ClearSelectedUINextFrame(); // Diƒüerleriyle tutarlƒ±
         }
-
-        if (eraserButton != null)
-        {
-            var img = eraserButton.GetComponent<Image>();
-            if (img != null) img.color = (eraserButton == selected) ? selectedColor : normalColor;
-        }
-
-        if (bucketButton != null)
-        {
-            var img = bucketButton.GetComponent<Image>();
-            if (img != null) img.color = (bucketButton == selected) ? selectedColor : normalColor;
-        }
-
-        if (moveButton != null)
-        {
-            var img = moveButton.GetComponent<Image>();
-            if (img != null) img.color = (moveButton == selected) ? selectedColor : normalColor;
-        }
+        UpdateSelectionVisuals(selectButton);
+        // Event System se√ßimini de g√ºncelle (mavi √ßer√ßeve)
+        if (EventSystem.current != null && selectButton != null)
+            EventSystem.current.SetSelectedGameObject(selectButton.gameObject);
     }
 
-    // Only update interactable state when history really changes
+    void UpdateSelectionVisuals(Button selected)
+    {
+        SetButtonColor(penButton, selected);
+        SetButtonColor(eraserButton, selected);
+        SetButtonColor(bucketButton, selected);
+        SetButtonColor(moveButton, selected);
+        SetButtonColor(selectButton, selected);
+    }
+
+    void SetButtonColor(Button btn, Button selected)
+    {
+        if (btn == null) return;
+        Image img = btn.GetComponent<Image>();
+        if (img != null)
+            img.color = (btn == selected) ? selectedColor : normalColor;
+    }
+
     void UpdateUndoRedoInteractable()
     {
-        if (undoButton != null)
-            undoButton.interactable = (pixelCanvas != null && pixelCanvas.CanUndo());
-
-        if (redoButton != null)
-            redoButton.interactable = (pixelCanvas != null && pixelCanvas.CanRedo());
+        if (undoButton != null && pixelCanvas != null)
+            undoButton.interactable = pixelCanvas.CanUndo();
+        if (redoButton != null && pixelCanvas != null)
+            redoButton.interactable = pixelCanvas.CanRedo();
     }
 }

@@ -1,17 +1,9 @@
-// AIDrawController_Streaming.cs
-using System;
+ï»¿using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Text.RegularExpressions;
 using UnityEngine;
 
-/// <summary>
-/// AIDrawController (streaming-friendly)
-/// - RequestDraw / RequestDrawWithState / RequestDrawWithFullPixels (kýsa fallback mantýðý býrakýldý)
-/// - Eðer streamApply true ise assistant çýktýsýný satýr satýr uygular ve ilerlemeyi anlýk gösterir.
-/// - Pause/Resume/Stop kontrolü, batch uygulama, gecikme ayarlarý.
-/// - PixelCanvas (senin verdiðin sýnýf) ile doðrudan çalýþýr.
-/// </summary>
 public class AIDrawController_Streaming : MonoBehaviour
 {
     [Header("Integration")]
@@ -19,197 +11,193 @@ public class AIDrawController_Streaming : MonoBehaviour
     public PixelCanvas pixelCanvas;
 
     [Header("Realtime / streaming settings")]
-    [Tooltip("If true, apply assistant commands incrementally so you see drawing progress.")]
     public bool streamApply = true;
-    [Tooltip("Seconds to wait after each batch. 0 = no wait (fast). Use small positive like 0.01 for visible progress.")]
-    public float commandDelay = 0.02f;
-    [Tooltip("Apply this many commands in a tight loop before yielding to the engine (reduces per-line overhead).")]
-    public int batchSize = 8;
+    public float commandDelay = 0.01f;   // her batch arasÄ± bekleme (saniye)
+    public int batchSize = 4;           // bir karede kaÃ§ komut uygulanacak
 
     [Header("Fallback / safety")]
-    [Tooltip("If assistant returns empty or no commands, draw fallback procedural shape.")]
     public bool autoFallbackIfNoCommands = true;
     public int expectedTreeSize = 24;
 
-    // Progress event: (appliedCommands, totalCommands)
     public event Action<int, int> OnApplyProgress;
 
-    // Internal control
     Coroutine applyCoroutine = null;
     bool stopRequested = false;
     bool paused = false;
 
-    // ----------------------
-    // Public API (call from UI)
-    // ----------------------
-    public void RequestDraw(string userDescription)
+    // ---------- Åžablon Veri TabanÄ± ----------
+    private Dictionary<string, string[]> templates = new Dictionary<string, string[]>
     {
-        StartCoroutine(_RequestDrawCoroutine(userDescription));
-    }
-
-    public void RequestDrawWithState(string userDescription, bool sendFullCanvas = false, int maxRuns = 1200)
-    {
-        StartCoroutine(_RequestDrawWithStateCoroutine(userDescription, sendFullCanvas, maxRuns));
-    }
-
-    public void StopApply()
-    {
-        stopRequested = true;
-        paused = false;
-        if (applyCoroutine != null)
-        {
-            StopCoroutine(applyCoroutine);
-            applyCoroutine = null;
+        ["sword"] = new string[] {
+            "RECT 28 4 8 40 #A0A0A0",
+            "RECT 30 4 4 40 #C0C0C0",
+            "RECT 24 44 16 4 #8B4513",
+            "RECT 26 44 12 4 #A0522D",
+            "RECT 30 0 4 4 #D0D0D0",
+            "CIRCLE 32 44 4 #FFD700",
+            "LINE 32 4 32 44 #FFFFFF"
+        },
+        ["tree"] = new string[] {
+            "RECT 28 40 8 24 #8B4513",
+            "CIRCLE 32 20 16 #125B1A",
+            "CIRCLE 20 24 10 #2FA83D",
+            "CIRCLE 44 24 10 #2FA83D"
+        },
+        ["pine"] = new string[] {
+            "RECT 30 48 4 16 #8B4513",
+            "LINE 32 16 16 48 #0F5C12",
+            "LINE 32 16 48 48 #0F5C12",
+            "LINE 32 24 20 48 #1A8A1A",
+            "LINE 32 24 44 48 #1A8A1A",
+            "LINE 32 32 24 48 #2DB82D",
+            "LINE 32 32 40 48 #2DB82D"
+        },
+        ["house"] = new string[] {
+            "RECT 16 32 32 32 #8B4513",
+            "RECT 24 44 16 20 #FFD700",
+            "RECT 28 52 4 12 #8B4513",
+            "LINE 16 32 32 16 #A0A0A0",
+            "LINE 48 32 32 16 #A0A0A0"
+        },
+        ["star"] = new string[] {
+            "LINE 32 8 32 56 #FFD700",
+            "LINE 8 32 56 32 #FFD700",
+            "LINE 16 16 48 48 #FFD700",
+            "LINE 48 16 16 48 #FFD700"
+        },
+        ["heart"] = new string[] {
+            "CIRCLE 24 16 12 #FF0000",
+            "CIRCLE 40 16 12 #FF0000",
+            "LINE 16 24 32 52 #FF0000",
+            "LINE 48 24 32 52 #FF0000"
+        },
+        ["flower"] = new string[] {
+            "LINE 32 48 32 28 #0A5C0A",
+            "CIRCLE 32 20 6 #FF69B4",
+            "CIRCLE 26 24 5 #FF1493",
+            "CIRCLE 38 24 5 #FF1493",
+            "CIRCLE 24 30 5 #FF69B4",
+            "CIRCLE 40 30 5 #FF69B4",
+            "CIRCLE 30 34 4 #FFD700"
+        },
+        ["sun"] = new string[] {
+            "CIRCLE 32 32 12 #FFD700",
+            "LINE 32 12 32 20 #FFD700",
+            "LINE 32 44 32 52 #FFD700",
+            "LINE 12 32 20 32 #FFD700",
+            "LINE 44 32 52 32 #FFD700",
+            "LINE 20 20 26 26 #FFD700",
+            "LINE 44 44 38 38 #FFD700",
+            "LINE 44 20 38 26 #FFD700",
+            "LINE 20 44 26 38 #FFD700"
         }
-    }
+    };
 
-    public void PauseApply()
-    {
-        paused = true;
-    }
+    // ---------- Public API ----------
+    public void RequestDraw(string userDescription) => StartCoroutine(_RequestDrawCoroutine(userDescription));
+    public void RequestDrawWithState(string userDescription, bool sendFullCanvas = false, int maxRuns = 1200)
+        => StartCoroutine(_RequestDrawWithStateCoroutine(userDescription, sendFullCanvas, maxRuns));
 
-    public void ResumeApply()
-    {
-        paused = false;
-    }
+    public void StopApply() { stopRequested = true; paused = false; if (applyCoroutine != null) { StopCoroutine(applyCoroutine); applyCoroutine = null; } }
+    public void PauseApply() => paused = true;
+    public void ResumeApply() => paused = false;
 
-    // ----------------------
-    // Coroutines that ask ChatManager
-    // ----------------------
+    // ---------- Coroutine'ler ----------
     IEnumerator _RequestDrawCoroutine(string userDesc)
     {
-        if (chatManager == null || pixelCanvas == null)
-        {
-            Debug.LogWarning("[AIDrawController_Streaming] chatManager or pixelCanvas not assigned.");
-            yield break;
-        }
+        if (chatManager == null || pixelCanvas == null) yield break;
 
-        string prompt = $"CanvasSize: {pixelCanvas.width} {pixelCanvas.height}\nDraw: {userDesc}\nReturn only drawing commands.";
-        string sys = "You are a strict Pixel Art Drawing Assistant. Output only drawing commands.";
+        // AI'dan sadece nesne adÄ± iste
+        string prompt = userDesc;
+        string sys = @"
+You are a request analyzer. User will ask to draw something.
+Respond ONLY with the single object name in English (lowercase, no punctuation).
+Examples:
+'draw a sword' -> sword
+'bir aÄŸaÃ§ Ã§iz' -> tree
+'pixel art house' -> house
+'gÃ¼zel bir kÄ±lÄ±Ã§ yap' -> sword
+'Ã§iÃ§ek Ã§iz' -> flower
+";
 
         string result = null;
         yield return StartCoroutine(chatManager.SendRawPrompt(prompt, sys, (s) => result = s));
-
         HandleAssistantResult(result);
     }
 
     IEnumerator _RequestDrawWithStateCoroutine(string userDesc, bool sendFullCanvas, int maxRuns)
     {
-        if (chatManager == null || pixelCanvas == null)
-        {
-            Debug.LogWarning("[AIDrawController_Streaming] chatManager or pixelCanvas not assigned.");
-            yield break;
-        }
-
-        string stateText;
-        if (!sendFullCanvas)
-        {
-            if (pixelCanvas.GetNonBackgroundBoundingBox(out int xMin, out int yMin, out int xMax, out int yMax))
-            {
-                stateText = $"CROP {xMin} {yMin} {xMax - xMin + 1} {yMax - yMin + 1}\n";
-                stateText += pixelCanvas.ExportCroppedRLE(xMin, yMin, xMax, yMax, maxRuns);
-            }
-            else
-            {
-                stateText = $"CANVAS {pixelCanvas.width} {pixelCanvas.height}\n" + pixelCanvas.ExportPaletteLine() + "\nNOTE: canvas empty\n";
-            }
-        }
-        else
-        {
-            stateText = pixelCanvas.ExportStateRLE(includeAllRows: false, maxRuns: maxRuns);
-        }
-
-        string userBlock = $"UserRequest: {userDesc}\nGuidelines: Return only drawing commands (PIXEL/LINE/RECT/CIRCLE/FILL/BRUSH).";
-        string prompt = stateText + "\n" + userBlock;
-        string sys = "You are a strict Pixel Art Drawing Assistant. Output only drawing commands.";
-
-        string result = null;
-        yield return StartCoroutine(chatManager.SendRawPrompt(prompt, sys, (s) => result = s));
-
-        HandleAssistantResult(result);
+        // State ile Ã§izim yapmak iÃ§in de aynÄ± ÅŸablon mantÄ±ÄŸÄ±nÄ± kullanabiliriz
+        yield return StartCoroutine(_RequestDrawCoroutine(userDesc));
     }
 
-    // ----------------------
-    // Handle assistant output (choose incremental or batch)
-    // ----------------------
+    // ---------- Ã‡Ä±ktÄ±yÄ± iÅŸleme ----------
     void HandleAssistantResult(string result)
     {
         if (string.IsNullOrEmpty(result))
         {
-            Debug.LogWarning("[AIDrawController_Streaming] empty assistant result.");
+            Debug.LogWarning("[AIDrawController_Streaming] empty result");
             if (autoFallbackIfNoCommands) DrawFallbackTreeCentered(expectedTreeSize);
             return;
         }
 
-        // If already running, stop previous
-        if (applyCoroutine != null) StopApply();
+        // AI'dan gelen cevabÄ± temizle
+        string objectName = result.Trim().ToLowerInvariant().Replace(".", "").Replace(",", "").Replace("!", "").Replace("?", "");
 
-        stopRequested = false;
-        paused = false;
+        Debug.Log($"[AIDrawController_Streaming] AI returned object name: {objectName}");
 
-        // Parse into commands (preprocess ordering helps layering)
-        var rawLines = Regex.Split(result.Trim(), @"\r?\n");
-        var commands = PreprocessAndSortCommandsByVerticalCenter(rawLines);
-
-        if (commands.Count == 0)
+        // Åžablonda var mÄ± kontrol et
+        if (templates.ContainsKey(objectName))
         {
-            if (autoFallbackIfNoCommands) DrawFallbackTreeCentered(expectedTreeSize);
-            return;
-        }
-
-        if (streamApply)
-        {
+            var commands = new List<string>(templates[objectName]);
+            if (applyCoroutine != null) StopApply();
+            stopRequested = false;
+            paused = false;
             applyCoroutine = StartCoroutine(ApplyCommandsIncrementally(commands));
+            return;
         }
-        else
+
+        // Åžablonda yoksa, belki AI birden fazla kelime dÃ¶ndÃ¼ (Ã¶rn: "pixel art sword")
+        string[] words = objectName.Split(' ');
+        foreach (string word in words)
         {
-            // immediate apply (OLD behavior) — düzeltilmiþ: ExecuteSingleCommand döngüsü kullanýlýyor
-            int applied = 0;
-            foreach (var line in commands)
+            if (templates.ContainsKey(word))
             {
-                if (ExecuteSingleCommand(line)) applied++;
+                var commands = new List<string>(templates[word]);
+                if (applyCoroutine != null) StopApply();
+                stopRequested = false;
+                paused = false;
+                applyCoroutine = StartCoroutine(ApplyCommandsIncrementally(commands));
+                return;
             }
-            OnApplyProgress?.Invoke(applied, commands.Count);
-            applyCoroutine = null;
         }
+
+        // HiÃ§bir ÅŸey bulunamadÄ±ysa fallback
+        Debug.LogWarning("[AIDrawController_Streaming] unknown object: " + objectName);
+        if (autoFallbackIfNoCommands) DrawFallbackTreeCentered(expectedTreeSize);
     }
 
-    // ----------------------
-    // Incremental application coroutine
-    // ----------------------
     IEnumerator ApplyCommandsIncrementally(List<string> commands)
     {
         int total = commands.Count;
         int applied = 0;
-
         OnApplyProgress?.Invoke(applied, total);
 
-        // Process in batches to avoid blocking
         for (int i = 0; i < commands.Count;)
         {
             if (stopRequested) break;
-
-            // pause support
-            while (paused)
-            {
-                yield return null;
-                if (stopRequested) break;
-            }
+            while (paused) { yield return null; if (stopRequested) break; }
             if (stopRequested) break;
 
             int end = Math.Min(i + batchSize, commands.Count);
             for (int j = i; j < end; j++)
             {
                 if (stopRequested) break;
-                string line = commands[j];
-                bool ok = ExecuteSingleCommand(line);
-                if (ok) applied++;
+                if (ExecuteSingleCommand(commands[j])) applied++;
             }
 
-            // Let PixelCanvas update its texture (it uses dirty flag and updates in Update)
             OnApplyProgress?.Invoke(applied, total);
 
-            // yield to next frame so UI updates show the changes
             if (commandDelay > 0f)
                 yield return new WaitForSecondsRealtime(commandDelay);
             else
@@ -218,26 +206,17 @@ public class AIDrawController_Streaming : MonoBehaviour
             i = end;
         }
 
-        // finished
         applyCoroutine = null;
-
         if (applied == 0 && autoFallbackIfNoCommands)
-        {
-            Debug.Log("[AIDrawController_Streaming] no commands applied -> fallback.");
             DrawFallbackTreeCentered(expectedTreeSize);
-        }
     }
 
-    // ----------------------
-    // Single-line executor (returns true when an actual draw op applied)
-    // ----------------------
+    // ---------- Tek komut yÃ¼rÃ¼tme ----------
     bool ExecuteSingleCommand(string rawLine)
     {
         if (string.IsNullOrWhiteSpace(rawLine)) return false;
-
         string line = rawLine.Trim().TrimEnd('.', ';');
 
-        // Detect explicit overwrite
         bool allowOverwrite = Regex.IsMatch(line, @"\bOVERWRITE\b", RegexOptions.IgnoreCase);
         if (allowOverwrite)
             line = Regex.Replace(line, @"\bOVERWRITE\b", "", RegexOptions.IgnoreCase).Trim();
@@ -250,25 +229,17 @@ public class AIDrawController_Streaming : MonoBehaviour
         {
             switch (cmd)
             {
-                case "BRUSH":
-                    // brush only influence local UI; we ignore it for now
-                    return true;
+                case "BRUSH": return true;
 
                 case "PIXEL":
-                    // support either "PIXEL x y #HEX" or "PIXEL #HEX x y"
                     if (parts.Length >= 4)
                     {
                         int px = 0, py = 0;
                         string hex = null;
                         if (int.TryParse(parts[1], out int t1) && int.TryParse(parts[2], out int t2))
-                        {
-                            px = t1; py = t2; hex = parts[3];
-                        }
+                        { px = t1; py = t2; hex = parts[3]; }
                         else if (TryParseHex(parts[1], out _))
-                        {
-                            hex = parts[1];
-                            if (!int.TryParse(parts[2], out px) || !int.TryParse(parts[3], out py)) return false;
-                        }
+                        { hex = parts[1]; if (!int.TryParse(parts[2], out px) || !int.TryParse(parts[3], out py)) return false; }
                         else return false;
 
                         if (TryParseHex(hex, out Color32 col))
@@ -283,16 +254,12 @@ public class AIDrawController_Streaming : MonoBehaviour
 
                 case "LINE":
                     if (parts.Length >= 6 &&
-                        int.TryParse(parts[1], out int x0) &&
-                        int.TryParse(parts[2], out int y0) &&
-                        int.TryParse(parts[3], out int x1) &&
-                        int.TryParse(parts[4], out int y1))
+                        int.TryParse(parts[1], out int x0) && int.TryParse(parts[2], out int y0) &&
+                        int.TryParse(parts[3], out int x1) && int.TryParse(parts[4], out int y1))
                     {
                         if (TryParseHex(parts[5], out Color32 lineCol))
                         {
-                            ClampCoords(ref x0, ref y0);
-                            ClampCoords(ref x1, ref y1);
-                            if (Math.Abs(x0 - x1) + Math.Abs(y0 - y1) == 0) return false;
+                            ClampCoords(ref x0, ref y0); ClampCoords(ref x1, ref y1);
                             if (allowOverwrite) pixelCanvas.DrawLineImmediate(x0, y0, x1, y1, lineCol);
                             else pixelCanvas.DrawLineRespectExisting(x0, y0, x1, y1, lineCol);
                             return true;
@@ -302,14 +269,11 @@ public class AIDrawController_Streaming : MonoBehaviour
 
                 case "RECT":
                     if (parts.Length >= 6 &&
-                        int.TryParse(parts[1], out int rx) &&
-                        int.TryParse(parts[2], out int ry) &&
-                        int.TryParse(parts[3], out int rw) &&
-                        int.TryParse(parts[4], out int rh))
+                        int.TryParse(parts[1], out int rx) && int.TryParse(parts[2], out int ry) &&
+                        int.TryParse(parts[3], out int rw) && int.TryParse(parts[4], out int rh))
                     {
                         if (TryParseHex(parts[5], out Color32 rectCol))
                         {
-                            if (rw <= 0 || rh <= 0) return false;
                             if (allowOverwrite) pixelCanvas.DrawRectImmediate(rx, ry, rw, rh, rectCol);
                             else pixelCanvas.DrawRectRespectExisting(rx, ry, rw, rh, rectCol);
                             return true;
@@ -319,9 +283,7 @@ public class AIDrawController_Streaming : MonoBehaviour
 
                 case "CIRCLE":
                     if (parts.Length >= 5 &&
-                        int.TryParse(parts[1], out int cx) &&
-                        int.TryParse(parts[2], out int cy) &&
-                        int.TryParse(parts[3], out int r))
+                        int.TryParse(parts[1], out int cx) && int.TryParse(parts[2], out int cy) && int.TryParse(parts[3], out int r))
                     {
                         if (TryParseHex(parts[4], out Color32 circleCol))
                         {
@@ -333,9 +295,7 @@ public class AIDrawController_Streaming : MonoBehaviour
                     break;
 
                 case "FILL":
-                    if (parts.Length >= 4 &&
-                        int.TryParse(parts[1], out int fx) &&
-                        int.TryParse(parts[2], out int fy))
+                    if (parts.Length >= 4 && int.TryParse(parts[1], out int fx) && int.TryParse(parts[2], out int fy))
                     {
                         if (TryParseHex(parts[3], out Color32 fillCol))
                         {
@@ -345,88 +305,13 @@ public class AIDrawController_Streaming : MonoBehaviour
                         }
                     }
                     break;
-
-                default:
-                    // unknown directive or PALETTE/CANVAS headers - ignore for drawing
-                    break;
             }
         }
-        catch (Exception ex)
-        {
-            Debug.LogWarning("[AIDrawController_Streaming] Exception executing command: " + rawLine + " -> " + ex);
-            return false;
-        }
-
+        catch (Exception ex) { Debug.LogWarning($"Command error: {rawLine} -> {ex}"); }
         return false;
     }
 
-    // ----------------------
-    // Helper parsing / ordering (same approach as full controller)
-    // ----------------------
-    List<string> PreprocessAndSortCommandsByVerticalCenter(IEnumerable<string> rawLines)
-    {
-        var brushOrDirectives = new List<string>();
-        var drawCommands = new List<(string line, float sortKey, int originalIndex)>();
-        int idx = 0;
-
-        foreach (var r in rawLines)
-        {
-            string line = r?.Trim();
-            if (string.IsNullOrEmpty(line)) { idx++; continue; }
-
-            if (Regex.IsMatch(line, @"^\s*BRUSH\b", RegexOptions.IgnoreCase) ||
-                Regex.IsMatch(line, @"^\s*PALETTE\b", RegexOptions.IgnoreCase) ||
-                Regex.IsMatch(line, @"^\s*(CANVAS|CROP|FULLPIXELS)\b", RegexOptions.IgnoreCase))
-            {
-                brushOrDirectives.Add(line);
-                idx++; continue;
-            }
-
-            float avgY = pixelCanvas != null ? (float)pixelCanvas.height * 0.5f : 0f;
-            bool parsed = false;
-
-            var mPixel = Regex.Match(line, @"^\s*PIXEL\s+(-?\d+)\s+(-?\d+)", RegexOptions.IgnoreCase);
-            if (mPixel.Success && int.TryParse(mPixel.Groups[2].Value, out int py)) { avgY = py; parsed = true; }
-
-            var mLine = Regex.Match(line, @"^\s*LINE\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)", RegexOptions.IgnoreCase);
-            if (!parsed && mLine.Success && int.TryParse(mLine.Groups[2].Value, out int y0) && int.TryParse(mLine.Groups[4].Value, out int y1))
-            {
-                avgY = (y0 + y1) * 0.5f; parsed = true;
-            }
-
-            var mRect = Regex.Match(line, @"^\s*RECT\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)", RegexOptions.IgnoreCase);
-            if (!parsed && mRect.Success && int.TryParse(mRect.Groups[2].Value, out int ry) && int.TryParse(mRect.Groups[4].Value, out int rh))
-            {
-                int yEnd = ry + Math.Max(0, rh - 1);
-                avgY = (ry + yEnd) * 0.5f; parsed = true;
-            }
-
-            var mCircle = Regex.Match(line, @"^\s*CIRCLE\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)", RegexOptions.IgnoreCase);
-            if (!parsed && mCircle.Success && int.TryParse(mCircle.Groups[2].Value, out int cy)) { avgY = cy; parsed = true; }
-
-            var mFill = Regex.Match(line, @"^\s*FILL\s+(-?\d+)\s+(-?\d+)", RegexOptions.IgnoreCase);
-            if (!parsed && mFill.Success && int.TryParse(mFill.Groups[2].Value, out int fy)) { avgY = fy; parsed = true; }
-
-            drawCommands.Add((line, avgY, idx));
-            idx++;
-        }
-
-        drawCommands.Sort((a, b) =>
-        {
-            int cmp = b.sortKey.CompareTo(a.sortKey);
-            if (cmp != 0) return cmp;
-            return a.originalIndex.CompareTo(b.originalIndex);
-        });
-
-        var result = new List<string>();
-        result.AddRange(brushOrDirectives);
-        foreach (var d in drawCommands) result.Add(d.line);
-        return result;
-    }
-
-    // ----------------------
-    // Utilities
-    // ----------------------
+    // ---------- YardÄ±mcÄ±lar ----------
     bool TryParseHex(string hex, out Color32 color)
     {
         color = new Color32(0, 0, 0, 255);
@@ -434,23 +319,11 @@ public class AIDrawController_Streaming : MonoBehaviour
         string s = hex.Trim().Replace("\"", "").Replace("'", "");
         if (!s.StartsWith("#")) s = "#" + s;
         if (s.Length != 7) return false;
-        try
-        {
-            byte r = Convert.ToByte(s.Substring(1, 2), 16);
-            byte g = Convert.ToByte(s.Substring(3, 2), 16);
-            byte b = Convert.ToByte(s.Substring(5, 2), 16);
-            color = new Color32(r, g, b, 255);
-            return true;
-        }
+        try { byte r = Convert.ToByte(s.Substring(1, 2), 16); byte g = Convert.ToByte(s.Substring(3, 2), 16); byte b = Convert.ToByte(s.Substring(5, 2), 16); color = new Color32(r, g, b, 255); return true; }
         catch { return false; }
     }
 
-    void ClampCoords(ref int x, ref int y)
-    {
-        if (pixelCanvas == null) return;
-        x = Mathf.Clamp(x, 0, pixelCanvas.width - 1);
-        y = Mathf.Clamp(y, 0, pixelCanvas.height - 1);
-    }
+    void ClampCoords(ref int x, ref int y) { if (pixelCanvas) { x = Mathf.Clamp(x, 0, pixelCanvas.width - 1); y = Mathf.Clamp(y, 0, pixelCanvas.height - 1); } }
 
     void DrawFallbackTreeCentered(int treeSize)
     {
@@ -468,14 +341,12 @@ public class AIDrawController_Streaming : MonoBehaviour
         int trunkH = Math.Max(1, treeSize / 4);
         int trunkX = startX + (treeSize - trunkW) / 2;
         int trunkY = startY + (treeSize - trunkH);
-
         pixelCanvas.DrawRectImmediate(trunkX, trunkY, trunkW, trunkH, trunkCol);
 
         int cx = startX + treeSize / 2;
         int cy = startY + treeSize / 2 - treeSize / 8;
         int rOuter = Math.Max(0, treeSize / 2 - 2);
         int rInner = Math.Max(0, treeSize / 3);
-
         pixelCanvas.DrawCircleImmediate(cx, cy, rOuter, leafDark);
         pixelCanvas.DrawCircleImmediate(Math.Max(0, cx - rInner / 2), Math.Max(0, cy - rInner / 3), rInner, leafLight);
         pixelCanvas.DrawCircleImmediate(Math.Min(pixelCanvas.width - 1, cx + rInner / 3), Math.Max(0, cy - rInner / 4), rInner, leafLight);

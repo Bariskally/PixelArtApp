@@ -1,9 +1,9 @@
 ﻿using UnityEngine;
 using UnityEngine.UI;
-using UnityEngine.EventSystems;   // ← EventSystem için gerekli
+using UnityEngine.EventSystems;
 
 [RequireComponent(typeof(Button))]
-public class MoveToolButton : MonoBehaviour
+public class SelectToolButton : MonoBehaviour
 {
     public ToolPanelController controller;
     private Button btn;
@@ -21,8 +21,9 @@ public class MoveToolButton : MonoBehaviour
 
     void OnClick()
     {
-        if (controller != null) controller.OnMovePressed();
-        // Tıklanan butonu Event System'de seçili olarak işaretle
-        EventSystem.current.SetSelectedGameObject(btn.gameObject);
+        if (controller != null) controller.OnSelectPressed();
+        // Tıklanan butonu zorla seçili yap
+        if (EventSystem.current != null)
+            EventSystem.current.SetSelectedGameObject(btn.gameObject);
     }
 }

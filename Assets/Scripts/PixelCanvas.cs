@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
@@ -8,7 +8,7 @@ using UnityEngine.EventSystems;
 [RequireComponent(typeof(RawImage))]
 public class PixelCanvas : MonoBehaviour
 {
-    public enum Mode { Pen, Eraser, Bucket, Move }
+    public enum Mode { Pen, Eraser, Bucket, Move, Select }
 
     [Header("Canvas size (pixels)")]
     public int width = 1024;
@@ -42,6 +42,13 @@ public class PixelCanvas : MonoBehaviour
     [Header("History Settings")]
     public int maxHistory = 100;
 
+    [Header("Mirror Drawing")]
+    public bool mirrorX = false;
+    public bool mirrorY = false;
+
+    public void SetMirrorX(bool on) { mirrorX = on; }
+    public void SetMirrorY(bool on) { mirrorY = on; }
+
     [Header("Viewport Clamping")]
     [Tooltip("RectTransform of the visible panel (the mask/viewport containing the canvas). If left null, parent RectTransform is used.")]
     public RectTransform viewport;
@@ -50,11 +57,16 @@ public class PixelCanvas : MonoBehaviour
     [Tooltip("If true, canvas position will be clamped to remain visible within the viewport after pan/zoom.")]
     public bool enforceViewportBounds = true;
 
+
+
     // Internal graphic buffer
     Texture2D tex;
     RawImage rawImage;
     public Color32[] pixelBuffer; // public for debugging / AI controller read access
     bool dirty = false;
+
+    // Diğer değişkenlerin yanına (örneğin `bool dirty = false;` altına)
+    public HashSet<int> userModifiedPixels = new HashSet<int>();
 
     RectTransform rt;
     Canvas parentCanvas;
@@ -74,10 +86,37 @@ public class PixelCanvas : MonoBehaviour
     // Event: UI can subscribe to this to refresh undo/redo buttons only when history changes
     public event Action OnHistoryChanged;
 
+    // *** YENİ EVENT: Renk değiştiğinde tetiklenir ***
+    public event Action<Color32> OnDrawColorChanged;
+
     // Move / Pan state
     bool isPanning = false;
     Vector3 lastPanWorldPos;
 
+    // Selection state
+    bool isSelecting = false;
+    Vector2Int selectionStart, selectionEnd;
+    bool hasSelection = false;
+    RectInt selectedRect;
+
+    // Taşıma
+    bool isMovingSelection = false;
+    Vector2Int moveOffset;
+    Vector2Int moveStartMousePixel;
+    Dictionary<int, Color32> originalSelectionColors = new Dictionary<int, Color32>();
+
+    // Pano
+    Color32[] clipboardPixels;
+    int clipboardWidth, clipboardHeight;
+    bool clipboardValid = false;
+
+
+    public event Action<RectInt> OnSelectionChanged;
+
+    // Overlay for selection visualization
+    RawImage overlayRawImage;
+    Texture2D overlayTex;
+    HashSet<int> selectedPixels = new HashSet<int>();
     void Start()
     {
         rawImage = GetComponent<RawImage>();
@@ -95,6 +134,31 @@ public class PixelCanvas : MonoBehaviour
         // ensure no UI element stays selected on start (prevents "pressed" highlight)
         if (EventSystem.current != null)
             EventSystem.current.SetSelectedGameObject(null);
+
+
+
+        // --- Setup overlay RawImage for selection ---
+        GameObject overlayGO = new GameObject("SelectionOverlay", typeof(RectTransform), typeof(RawImage));
+        overlayGO.transform.SetParent(rt, false);
+        overlayRawImage = overlayGO.GetComponent<RawImage>();
+
+        overlayTex = new Texture2D(width, height, TextureFormat.RGBA32, false);
+        overlayTex.filterMode = FilterMode.Point;
+        Color32[] clear = new Color32[width * height];
+        for (int i = 0; i < clear.Length; i++) clear[i] = new Color32(0, 0, 0, 0);
+        overlayTex.SetPixels32(clear);
+        overlayTex.Apply();
+        overlayRawImage.texture = overlayTex;
+        overlayRawImage.raycastTarget = false;
+
+        RectTransform overlayRT = overlayGO.GetComponent<RectTransform>();
+        overlayRT.pivot = rt.pivot;
+        overlayRT.anchorMin = rt.anchorMin;
+        overlayRT.anchorMax = rt.anchorMax;
+        overlayRT.anchoredPosition = rt.anchoredPosition;
+        overlayRT.sizeDelta = rt.sizeDelta;
+
+
     }
 
     void CreateTexture()
@@ -116,20 +180,19 @@ public class PixelCanvas : MonoBehaviour
 
         rawImage.texture = tex;
 
-        // SCALEFACTOR FIX � 1:1 ekran piksel e�lemesi
+        // SCALEFACTOR FIX — 1:1 ekran piksel eşlemesi
         float scale = parentCanvas != null ? parentCanvas.scaleFactor : 1f;
         rt.sizeDelta = new Vector2(width / scale, height / scale);
         rt.pivot = new Vector2(0.5f, 0.5f);
+
+        userModifiedPixels.Clear();
     }
 
     void Update()
     {
         HandleZoom();
-
-        // decrement ignore pointer frames if set
         if (ignorePointerFrames > 0) ignorePointerFrames--;
 
-        // Klavye k�sayollar� (Ctrl/Cmd+Z, Ctrl/Cmd+Y)
         bool ctrl = Input.GetKey(KeyCode.LeftControl) || Input.GetKey(KeyCode.RightControl)
                     || Input.GetKey(KeyCode.LeftCommand) || Input.GetKey(KeyCode.RightCommand);
 
@@ -139,7 +202,6 @@ public class PixelCanvas : MonoBehaviour
             Undo();
             ClearSelectedUINextFrame();
         }
-
         if (ctrl && Input.GetKeyDown(KeyCode.Y))
         {
             if (currentAction != null) EndAction();
@@ -147,61 +209,73 @@ public class PixelCanvas : MonoBehaviour
             ClearSelectedUINextFrame();
         }
 
-        // --- Move (pan) ba�lang�c� ---
+        // --- Move ---
         if (currentMode == Mode.Move)
         {
-            // Ba�lang��: mouse down ise ve pointer canvas'�n �zerinde ise panning ba�lat
-            if (Input.GetMouseButtonDown(0) && ignorePointerFrames == 0 && IsPointerOverCanvasTexture())
+            if (ignorePointerFrames > 0) return;
+
+            Camera cam = parentCanvas != null ? parentCanvas.worldCamera : null;
+
+            // Sol tık ile pan başlat
+            if (Input.GetMouseButtonDown(0) && IsPointerOverCanvasTexture())
             {
-                Camera cam = parentCanvas != null ? parentCanvas.worldCamera : null;
-                Vector3 worldPoint;
-                if (RectTransformUtility.ScreenPointToWorldPointInRectangle(rt, Input.mousePosition, cam, out worldPoint))
-                {
-                    isPanning = true;
-                    lastPanWorldPos = worldPoint;
-                    ClearSelectedUINextFrame();
-                }
+                isPanning = true;
+                RectTransformUtility.ScreenPointToWorldPointInRectangle(
+                    rt, Input.mousePosition, cam, out lastPanWorldPos);
             }
 
-            // Panning devam�: mouse held
-            if (isPanning && Input.GetMouseButton(0))
+            // Sürükleme sırasında canvas'ı taşı
+            if (Input.GetMouseButton(0) && isPanning)
             {
-                Camera cam = parentCanvas != null ? parentCanvas.worldCamera : null;
-                Vector3 currentWorld;
-                if (RectTransformUtility.ScreenPointToWorldPointInRectangle(rt, Input.mousePosition, cam, out currentWorld))
-                {
-                    Vector3 delta = currentWorld - lastPanWorldPos;
-                    rt.position += delta;
-                    lastPanWorldPos = currentWorld;
+                Vector3 currentWorldPos;
+                RectTransformUtility.ScreenPointToWorldPointInRectangle(
+                    rt, Input.mousePosition, cam, out currentWorldPos);
 
-                    if (enforceViewportBounds) ClampPositionToViewport_Strict();
-                }
+                Vector3 delta = currentWorldPos - lastPanWorldPos;
+                rt.position += delta;
+                lastPanWorldPos = currentWorldPos;
+
+                if (enforceViewportBounds) ClampPositionToViewport_Strict();
             }
 
-            // Panning biti�i
-            if (isPanning && Input.GetMouseButtonUp(0))
+            // Tuş bırakıldığında pan bitir
+            if (Input.GetMouseButtonUp(0))
             {
                 isPanning = false;
             }
 
-            // while in Move mode, don't process drawing input
             return;
         }
-        // --- Move (pan) sonu ---
 
-        // BeginAction only if mouse down is actually on the canvas texture (topmost element)
-        if (Input.GetMouseButtonDown(0))
+        // --- Select ---
+        if (currentMode == Mode.Select)
         {
-            if (ignorePointerFrames == 0)
+            HandleSelectMode();
+
+            if (hasSelection && !isMovingSelection && !isSelecting)
             {
-                if ((currentMode == Mode.Pen || currentMode == Mode.Eraser) && IsPointerOverCanvasTexture())
-                {
-                    BeginAction();
-                }
+                if (Input.GetKeyDown(KeyCode.Delete)) DeleteSelectedPixels();
             }
+            if (ctrl && Input.GetKeyDown(KeyCode.C)) CopySelectedPixels();
+            if (ctrl && Input.GetKeyDown(KeyCode.V) && clipboardValid) PasteClipboardAtMouse();
+
+            if (dirty)
+            {
+                tex.SetPixels32(pixelBuffer);
+                tex.Apply();
+                dirty = false;
+            }
+            return;   // <-- bu return sadece Select modundayken çalışır, diğer modlara geçince atlanır
         }
 
-        HandleInput();
+        // --- Pen / Eraser / Bucket (orijinal HandleInput) ---
+        if (Input.GetMouseButtonDown(0) && ignorePointerFrames == 0)
+        {
+            if ((currentMode == Mode.Pen || currentMode == Mode.Eraser) && IsPointerOverCanvasTexture())
+                BeginAction();
+        }
+
+        HandleInput();   // <-- kalem, silgi, kova burada çalışır
 
         if (Input.GetMouseButtonUp(0))
         {
@@ -265,6 +339,7 @@ public class PixelCanvas : MonoBehaviour
 
         currentZoom = desiredZoom;
         rt.localScale = Vector3.one * currentZoom;
+
 
         Vector3 afterZoomPos;
         RectTransformUtility.ScreenPointToWorldPointInRectangle(rt, mousePos, cam, out afterZoomPos);
@@ -360,26 +435,10 @@ public class PixelCanvas : MonoBehaviour
     {
         if (currentAction == null) BeginAction();
 
-        int half = brushSize / 2;
-        int w = width;
-        for (int yy = y - half; yy <= y + half; yy++)
-        {
-            if (yy < 0 || yy >= height) continue;
-            int row = yy * w;
-            for (int xx = x - half; xx <= x + half; xx++)
-            {
-                if (xx < 0 || xx >= width) continue;
-                int idx = row + xx;
-                Color32 prev = pixelBuffer[idx];
-                Color32 next = drawColor;
-                if (!ColorsEqual(prev, next))
-                {
-                    pixelBuffer[idx] = next;
-                    RecordChange(idx, prev, next);
-                    dirty = true;
-                }
-            }
-        }
+        StampBrush(x, y, drawColor);
+        if (mirrorX) StampBrush(width - 1 - x, y, drawColor);
+        if (mirrorY) StampBrush(x, height - 1 - y, drawColor);
+        if (mirrorX && mirrorY) StampBrush(width - 1 - x, height - 1 - y, drawColor);
     }
 
     void FillBackgroundPattern()
@@ -431,6 +490,7 @@ public class PixelCanvas : MonoBehaviour
             }
         }
         EndAction();
+        userModifiedPixels.Clear();
         dirty = true;
     }
 
@@ -454,26 +514,10 @@ public class PixelCanvas : MonoBehaviour
     {
         if (currentAction == null) BeginAction();
 
-        int half = brushSize / 2;
-        int w = width;
-        for (int yy = y - half; yy <= y + half; yy++)
-        {
-            if (yy < 0 || yy >= height) continue;
-            int row = yy * w;
-            for (int xx = x - half; xx <= x + half; xx++)
-            {
-                if (xx < 0 || xx >= width) continue;
-                int idx = row + xx;
-                Color32 prev = pixelBuffer[idx];
-                Color32 next = GetBackgroundColorAt(xx, yy);
-                if (!ColorsEqual(prev, next))
-                {
-                    pixelBuffer[idx] = next;
-                    RecordChange(idx, prev, next);
-                    dirty = true;
-                }
-            }
-        }
+        StampEraser(x, y);
+        if (mirrorX) StampEraser(width - 1 - x, y);
+        if (mirrorY) StampEraser(x, height - 1 - y);
+        if (mirrorX && mirrorY) StampEraser(width - 1 - x, height - 1 - y);
     }
 
     public void FloodFill(int startX, int startY, Color32 newColor)
@@ -518,6 +562,7 @@ public class PixelCanvas : MonoBehaviour
             Color32 prev = current;
             pixelBuffer[idx] = newColor;
             RecordChange(idx, prev, newColor);
+            userModifiedPixels.Add(idx);
 
             int x = idx % w;
             int y = idx / w;
@@ -551,10 +596,14 @@ public class PixelCanvas : MonoBehaviour
         EditAction action = undoStack[lastIndex];
         undoStack.RemoveAt(lastIndex);
 
-        for (int i = 0; i < action.edits.Count; i++)
+        foreach (PixelEdit e in action.edits)
         {
-            PixelEdit e = action.edits[i];
             pixelBuffer[e.idx] = e.prev;
+
+            if (IsBackgroundColor(e.prev))
+                userModifiedPixels.Remove(e.idx);
+            else
+                userModifiedPixels.Add(e.idx);
         }
 
         redoStack.Add(action);
@@ -572,10 +621,14 @@ public class PixelCanvas : MonoBehaviour
         EditAction action = redoStack[lastIndex];
         redoStack.RemoveAt(lastIndex);
 
-        for (int i = 0; i < action.edits.Count; i++)
+        foreach (PixelEdit e in action.edits)
         {
-            PixelEdit e = action.edits[i];
             pixelBuffer[e.idx] = e.next;
+
+            if (IsBackgroundColor(e.next))
+                userModifiedPixels.Remove(e.idx);
+            else
+                userModifiedPixels.Add(e.idx);
         }
 
         undoStack.Add(action);
@@ -590,7 +643,15 @@ public class PixelCanvas : MonoBehaviour
     public void SetModeMove() { currentMode = Mode.Move; }
 
     public void SetBrushSize(int newSize) { brushSize = Mathf.Max(1, newSize); }
-    public void SetDrawColor(Color32 c) { drawColor = c; }
+
+    // *** GÜNCELLENMİŞ SetDrawColor ***
+    public void SetDrawColor(Color32 c)
+    {
+        if (ColorsEqual(drawColor, c)) return; // aynı renkse tetikleme
+        drawColor = c;
+        OnDrawColorChanged?.Invoke(drawColor);
+    }
+
     public Mode GetMode() => currentMode;
 
     public void FillAll(Color32 color)
@@ -926,7 +987,7 @@ public class PixelCanvas : MonoBehaviour
     }
 
     /// <summary>
-    /// Export pixel list as compact JSON object (array of {x,y,color}) � useful if model expects JSON.
+    /// Export pixel list as compact JSON object (array of {x,y,color}) — useful if model expects JSON.
     /// </summary>
     public string ExportFullPixelListAsJson(bool includeBackground = false, bool useCropIfPossible = true, int maxPixels = 8192)
     {
@@ -1358,8 +1419,556 @@ public class PixelCanvas : MonoBehaviour
         }
         catch { return false; }
     }
+
+    private bool IsBackgroundColor(Color32 c)
+    {
+        if (showCheckerboard)
+        {
+            if (ColorsEqual(c, bgColorA) || ColorsEqual(c, bgColorB))
+                return true;
+            if (showGridLines && ColorsEqual(c, gridLineColor))
+                return true;
+        }
+        else
+        {
+            if (ColorsEqual(c, bgColorA))
+                return true;
+        }
+        return false;
+    }
+
+    public void SetModeSelect()
+    {
+        currentMode = Mode.Select;
+    }
+
+
     // Example ColorsEqual helper (kept)
     // (Also BeginAction/RecordChange/EndAction/Undo/Redo are present above and used by these methods.)
 
+
+    // ------------------------------------------------------------
+    // SELECTION HANDLING
+    // ------------------------------------------------------------
+    // ------------------------------------------------------------
+    // SELECTION HANDLING
+    // ------------------------------------------------------------
+    void HandleSelectMode()
+    {
+        if (ignorePointerFrames > 0) return;
+
+        // --- Mouse Down ---
+        if (Input.GetMouseButtonDown(0) && IsPointerOverCanvasTexture())
+        {
+            if (TryGetMousePixel(out int px, out int py))
+            {
+                // Eğer seçili alan varsa ve tıklanan piksel seçili alanın içindeyse → taşıma başlat
+                if (hasSelection && IsPixelInSelection(px, py))
+                {
+                    isMovingSelection = true;
+                    moveStartMousePixel = new Vector2Int(px, py);
+                    moveOffset = Vector2Int.zero;
+                    StoreOriginalSelectionPixels();
+                    ClearSelectionPixels(true); // true: undo kaydı yap
+                    ClearOverlayPixels();
+                    return;
+                }
+                else
+                {
+                    // Mevcut seçimi temizle
+                    ClearSelection();
+                    // Yeni bir seçim başlat
+                    isSelecting = true;
+                    selectionStart = new Vector2Int(px, py);
+                    selectionEnd = selectionStart;
+                }
+            }
+        }
+
+        // --- Mouse Held (sürükleme) ---
+        if (isSelecting && Input.GetMouseButton(0))
+        {
+            if (TryGetMousePixel(out int px, out int py))
+            {
+                Vector2Int current = new Vector2Int(px, py);
+                if (current != selectionEnd)
+                {
+                    selectionEnd = current;
+                    DrawOverlayRect(selectionStart, selectionEnd);
+                }
+            }
+        }
+
+        // --- Mouse Held (taşıma) ---
+        if (isMovingSelection && Input.GetMouseButton(0))
+        {
+            if (TryGetMousePixel(out int px, out int py))
+            {
+                Vector2Int current = new Vector2Int(px, py);
+                Vector2Int delta = current - moveStartMousePixel;
+                if (delta != moveOffset)
+                {
+                    moveOffset = ClampMoveOffset(delta);
+                    DrawMoveOverlay(moveOffset);
+                }
+            }
+        }
+
+        // --- Mouse Up ---
+        if (Input.GetMouseButtonUp(0))
+        {
+            if (isSelecting)
+            {
+                isSelecting = false;
+                if (selectionStart == selectionEnd)
+                {
+                    // Tek tıklama → mevcut seçimi temizlemişti zaten, başka işlem yok
+                    hasSelection = false;
+                    OnSelectionChanged?.Invoke(new RectInt(0, 0, 0, 0));
+                }
+                else
+                {
+                    // Dikdörtgen seçimi
+                    int xMin = Mathf.Min(selectionStart.x, selectionEnd.x);
+                    int xMax = Mathf.Max(selectionStart.x, selectionEnd.x);
+                    int yMin = Mathf.Min(selectionStart.y, selectionEnd.y);
+                    int yMax = Mathf.Max(selectionStart.y, selectionEnd.y);
+
+                    selectedPixels.Clear();
+                    for (int y = yMin; y <= yMax; y++)
+                        for (int x = xMin; x <= xMax; x++)
+                            selectedPixels.Add(y * width + x);
+
+                    hasSelection = selectedPixels.Count > 0;
+                    OnSelectionChanged?.Invoke(GetBoundingBoxFromSelectedPixels());
+                }
+            }
+            else if (isMovingSelection)
+            {
+                isMovingSelection = false;
+                // Taşınan pikselleri yeni konuma yerleştir
+                ApplyMoveSelection(moveOffset);
+                // Yeni seçili alanı güncelle
+                UpdateSelectionAfterMove();
+                // Overlay'ı yeni seçili alanda göster
+                DrawOverlayRect(GetBoundingBoxFromSelectedPixels());
+            }
+        }
+    }
+
+
+
+    public void ClearSelection()
+    {
+        ClearOverlayPixels();               // overlay'i temizle, selectedPixels'i de temizler
+        hasSelection = false;
+        isSelecting = false;
+        OnSelectionChanged?.Invoke(new RectInt(0, 0, 0, 0));
+    }
+
+    public IEnumerable<int> GetSelectedPixelIndices()
+    {
+        return selectedPixels;
+    }
+
+
+    public bool HasSelection => hasSelection;
+    public RectInt SelectedRect => selectedRect;
+
+
+
+    /// <summary>
+    /// Overlay texture'daki belirli bir pikseli mavi (seçili) veya transparan (seçili değil) yapar.
+    /// </summary>
+    void SetOverlayPixel(int idx, bool selected)
+    {
+        Color32 col = selected ? new Color32(0, 0, 255, 180) : new Color32(0, 0, 0, 0);
+        overlayTex.SetPixel(idx % width, idx / width, col);
+    }
+
+    /// <summary>
+    /// Tüm overlay texture'ı transparan yapar.
+    /// </summary>
+    void ClearOverlayTexture()
+    {
+        Color32[] clear = new Color32[width * height];
+        for (int i = 0; i < clear.Length; i++)
+            clear[i] = new Color32(0, 0, 0, 0);
+        overlayTex.SetPixels32(clear);
+        overlayTex.Apply();
+    }
+
+    /// <summary>
+    /// Seçili piksellerin oluşturduğu bounding rectangle'ı döndürür.
+    /// </summary>
+    RectInt GetBoundingBoxFromSelectedPixels()
+    {
+        if (selectedPixels.Count == 0) return new RectInt(0, 0, 0, 0);
+        int xMin = width, yMin = height, xMax = -1, yMax = -1;
+        foreach (int idx in selectedPixels)
+        {
+            int x = idx % width;
+            int y = idx / width;
+            if (x < xMin) xMin = x;
+            if (x > xMax) xMax = x;
+            if (y < yMin) yMin = y;
+            if (y > yMax) yMax = y;
+        }
+        return new RectInt(xMin, yMin, xMax - xMin + 1, yMax - yMin + 1);
+    }
+
+    /// <summary>
+    /// Seçili piksellerin indislerini döndürür (zaten var olan GetSelectedPixelIndices ile aynı).
+    /// </summary>
+
+    /// <summary>
+    /// Overlay texture'ı tamamen saydam yapar (seçimi temizler).
+    /// </summary>
+    void ClearOverlayPixels()
+    {
+        Color32[] clear = new Color32[width * height];
+        for (int i = 0; i < clear.Length; i++) clear[i] = new Color32(0, 0, 0, 0);
+        overlayTex.SetPixels32(clear);
+        overlayTex.Apply();
+        selectedPixels.Clear();
+    }
+
+    /// <summary>
+    /// Overlay üzerinde iki nokta arasındaki dikdörtgeni mavi ile doldurur.
+    /// </summary>
+    void DrawOverlayRect(Vector2Int from, Vector2Int to)
+    {
+        int xMin = Mathf.Clamp(Mathf.Min(from.x, to.x), 0, width - 1);
+        int xMax = Mathf.Clamp(Mathf.Max(from.x, to.x), 0, width - 1);
+        int yMin = Mathf.Clamp(Mathf.Min(from.y, to.y), 0, height - 1);
+        int yMax = Mathf.Clamp(Mathf.Max(from.y, to.y), 0, height - 1);
+
+        // Önce overlay'i temizle
+        Color32[] clear = new Color32[width * height];
+        for (int i = 0; i < clear.Length; i++) clear[i] = new Color32(0, 0, 0, 0);
+
+        // Dikdörtgen alanı mavi yap
+        Color32 blue = new Color32(0, 0, 255, 180);
+        for (int y = yMin; y <= yMax; y++)
+        {
+            int row = y * width;
+            for (int x = xMin; x <= xMax; x++)
+            {
+                clear[row + x] = blue;
+            }
+        }
+
+        overlayTex.SetPixels32(clear);
+        overlayTex.Apply();
+    }
+
+    bool IsPixelInSelection(int x, int y)
+    {
+        RectInt r = GetBoundingBoxFromSelectedPixels();
+        return x >= r.xMin && x <= r.xMax && y >= r.yMin && y <= r.yMax;
+    }
+
+    void StoreOriginalSelectionPixels()
+    {
+        originalSelectionColors.Clear();
+        foreach (int idx in selectedPixels)
+        {
+            int x = idx % width;
+            int y = idx / width;
+            if (!IsBackgroundAt(x, y))              // <-- arka plan değilse
+                originalSelectionColors[idx] = pixelBuffer[idx];
+        }
+    }
+
+    void ClearSelectionPixels(bool recordUndo)
+    {
+        if (recordUndo) BeginAction();
+        foreach (int idx in originalSelectionColors.Keys)   // sadece saklananlar
+        {
+            Color32 bg = GetBackgroundColorAt(idx % width, idx / width);
+            if (!ColorsEqual(pixelBuffer[idx], bg))
+            {
+                if (recordUndo) RecordChange(idx, pixelBuffer[idx], bg);
+                pixelBuffer[idx] = bg;
+            }
+        }
+        if (recordUndo) EndAction();
+        dirty = true;
+    }
+
+    Vector2Int ClampMoveOffset(Vector2Int offset)
+    {
+        RectInt bounds = GetBoundingBoxFromOriginalSelection();
+        int minX = bounds.xMin + offset.x;
+        int maxX = bounds.xMax + offset.x;
+        int minY = bounds.yMin + offset.y;
+        int maxY = bounds.yMax + offset.y;
+
+        if (minX < 0) offset.x -= minX;
+        if (maxX >= width) offset.x -= (maxX - width + 1);
+        if (minY < 0) offset.y -= minY;
+        if (maxY >= height) offset.y -= (maxY - height + 1);
+
+        return offset;
+    }
+
+    RectInt GetBoundingBoxFromOriginalSelection()
+    {
+        if (originalSelectionColors.Count == 0) return GetBoundingBoxFromSelectedPixels();
+        int xMin = width, yMin = height, xMax = -1, yMax = -1;
+        foreach (int idx in originalSelectionColors.Keys)
+        {
+            int x = idx % width;
+            int y = idx / width;
+            if (x < xMin) xMin = x;
+            if (x > xMax) xMax = x;
+            if (y < yMin) yMin = y;
+            if (y > yMax) yMax = y;
+        }
+        return new RectInt(xMin, yMin, xMax - xMin + 1, yMax - yMin + 1);
+    }
+
+    void DrawMoveOverlay(Vector2Int offset)
+    {
+        // Overlay'da, orijinal seçim alanını offset kadar kaydırarak göster
+        ClearOverlayPixels(); // overlay temizle
+        if (originalSelectionColors.Count == 0) return;
+
+        // Yeni overlay için geçici bir dizi oluştur (tekrar overlayTex.Apply yapılacak)
+        foreach (var kv in originalSelectionColors)
+        {
+            int srcIdx = kv.Key;
+            Color32 col = kv.Value;
+            int srcX = srcIdx % width;
+            int srcY = srcIdx / width;
+            int dstX = srcX + offset.x;
+            int dstY = srcY + offset.y;
+            if (dstX >= 0 && dstX < width && dstY >= 0 && dstY < height)
+            {
+                int dstIdx = dstY * width + dstX;
+                // Yarı saydam olarak göster
+                Color32 overlayCol = new Color32(col.r, col.g, col.b, 120);
+                overlayTex.SetPixel(dstX, dstY, overlayCol);
+            }
+        }
+        overlayTex.Apply();
+    }
+
+    void ApplyMoveSelection(Vector2Int offset)
+    {
+        BeginAction();
+        // Yeni pikselleri yaz
+        foreach (var kv in originalSelectionColors)
+        {
+            int srcIdx = kv.Key;
+            Color32 col = kv.Value;
+            int srcX = srcIdx % width;
+            int srcY = srcIdx / width;
+            int dstX = srcX + offset.x;
+            int dstY = srcY + offset.y;
+            if (dstX >= 0 && dstX < width && dstY >= 0 && dstY < height)
+            {
+                int dstIdx = dstY * width + dstX;
+                if (!ColorsEqual(pixelBuffer[dstIdx], col))
+                {
+                    RecordChange(dstIdx, pixelBuffer[dstIdx], col);
+                    pixelBuffer[dstIdx] = col;
+                }
+            }
+        }
+        EndAction();
+        dirty = true;
+    }
+
+    void UpdateSelectionAfterMove()
+    {
+        // selectedPixels'i yeni konuma göre güncelle
+        selectedPixels.Clear();
+        foreach (var kv in originalSelectionColors)
+        {
+            int srcIdx = kv.Key;
+            int srcX = srcIdx % width;
+            int srcY = srcIdx / width;
+            int dstX = srcX + moveOffset.x;
+            int dstY = srcY + moveOffset.y;
+            if (dstX >= 0 && dstX < width && dstY >= 0 && dstY < height)
+            {
+                selectedPixels.Add(dstY * width + dstX);
+            }
+        }
+        hasSelection = selectedPixels.Count > 0;
+        OnSelectionChanged?.Invoke(GetBoundingBoxFromSelectedPixels());
+    }
+
+
+    // ---- KOPYALA / YAPIŞTIR ----
+    void CopySelectedPixels()
+    {
+        if (!hasSelection) return;
+        RectInt rect = GetBoundingBoxFromSelectedPixels();
+        clipboardWidth = rect.width;
+        clipboardHeight = rect.height;
+        clipboardPixels = new Color32[clipboardWidth * clipboardHeight];
+        for (int y = 0; y < clipboardHeight; y++)
+        {
+            for (int x = 0; x < clipboardWidth; x++)
+            {
+                int srcX = rect.xMin + x;
+                int srcY = rect.yMin + y;
+                Color32 srcCol = pixelBuffer[srcY * width + srcX];
+                if (IsBackgroundAt(srcX, srcY))
+                {
+                    // Arka plan pikseli → tamamen saydam yap
+                    clipboardPixels[y * clipboardWidth + x] = new Color32(0, 0, 0, 0);
+                }
+                else
+                {
+                    // Kullanıcı çizimi → alfa 255 ile sakla
+                    clipboardPixels[y * clipboardWidth + x] = new Color32(srcCol.r, srcCol.g, srcCol.b, 255);
+                }
+            }
+        }
+        clipboardValid = true;
+    }
+
+    void PasteClipboardAtMouse()
+    {
+        if (!clipboardValid) return;
+        if (!TryGetMousePixel(out int px, out int py)) return;
+
+        int startX = px;
+        int startY = py;
+
+        BeginAction();
+        for (int y = 0; y < clipboardHeight; y++)
+        {
+            for (int x = 0; x < clipboardWidth; x++)
+            {
+                int dstX = startX + x;
+                int dstY = startY + y;
+                if (dstX < 0 || dstX >= width || dstY < 0 || dstY >= height) continue;
+
+                Color32 srcCol = clipboardPixels[y * clipboardWidth + x];
+                // Saydam (alfa 0) pikselleri atla
+                if (srcCol.a == 0) continue;
+
+                int dstIdx = dstY * width + dstX;
+                Color32 oldColor = pixelBuffer[dstIdx];
+                if (!ColorsEqual(oldColor, srcCol))
+                {
+                    RecordChange(dstIdx, oldColor, srcCol);
+                    pixelBuffer[dstIdx] = srcCol;
+                }
+            }
+        }
+        EndAction();
+        dirty = true;
+
+        // Yeni yapıştırılan alanı seçili hale getir
+        selectedPixels.Clear();
+        for (int y = 0; y < clipboardHeight; y++)
+        {
+            for (int x = 0; x < clipboardWidth; x++)
+            {
+                int px2 = startX + x;
+                int py2 = startY + y;
+                if (px2 >= 0 && px2 < width && py2 >= 0 && py2 < height)
+                    selectedPixels.Add(py2 * width + px2);
+            }
+        }
+        hasSelection = selectedPixels.Count > 0;
+        DrawOverlayRect(GetBoundingBoxFromSelectedPixels());
+        OnSelectionChanged?.Invoke(GetBoundingBoxFromSelectedPixels());
+    }
+
+    // ---- DELETE ----
+    void DeleteSelectedPixels()
+    {
+        if (!hasSelection) return;
+        BeginAction();
+        foreach (int idx in selectedPixels)
+        {
+            int x = idx % width;
+            int y = idx / width;
+            Color32 bg = GetBackgroundColorAt(x, y);
+            if (!ColorsEqual(pixelBuffer[idx], bg))
+            {
+                RecordChange(idx, pixelBuffer[idx], bg);
+                pixelBuffer[idx] = bg;
+            }
+        }
+        EndAction();
+        dirty = true;
+        ClearOverlayPixels();
+        selectedPixels.Clear();
+        hasSelection = false;
+        OnSelectionChanged?.Invoke(new RectInt(0, 0, 0, 0));
+    }
+
+    void DrawOverlayRect(RectInt rect)
+    {
+        DrawOverlayRect(new Vector2Int(rect.xMin, rect.yMin), new Vector2Int(rect.xMax, rect.yMax));
+    }
+
+    // YENİ YARDIMCI METOTLAR (sınıfın içine, DrawAt'ın hemen üstüne ekleyebilirsin)
+    void StampBrush(int cx, int cy, Color32 color)
+    {
+        int half = (brushSize - 1) / 2;
+        int startX = cx - half;
+        int startY = cy - half;
+        int w = width;
+        for (int yy = 0; yy < brushSize; yy++)
+        {
+            int py = startY + yy;
+            if (py < 0 || py >= height) continue;
+            int row = py * w;
+            for (int xx = 0; xx < brushSize; xx++)
+            {
+                int px = startX + xx;
+                if (px < 0 || px >= width) continue;
+                int idx = row + px;
+                Color32 prev = pixelBuffer[idx];
+                Color32 next = color;
+                if (!ColorsEqual(prev, next))
+                {
+                    pixelBuffer[idx] = next;
+                    RecordChange(idx, prev, next);
+                    dirty = true;
+                }
+                userModifiedPixels.Add(idx);
+            }
+        }
+    }
+
+    void StampEraser(int cx, int cy)
+    {
+        int half = (brushSize - 1) / 2;
+        int startX = cx - half;
+        int startY = cy - half;
+        int w = width;
+        for (int yy = 0; yy < brushSize; yy++)
+        {
+            int py = startY + yy;
+            if (py < 0 || py >= height) continue;
+            int row = py * w;
+            for (int xx = 0; xx < brushSize; xx++)
+            {
+                int px = startX + xx;
+                if (px < 0 || px >= width) continue;
+                int idx = row + px;
+                Color32 prev = pixelBuffer[idx];
+                Color32 next = GetBackgroundColorAt(px, py);
+                if (!ColorsEqual(prev, next))
+                {
+                    pixelBuffer[idx] = next;
+                    RecordChange(idx, prev, next);
+                    userModifiedPixels.Remove(idx);
+                    dirty = true;
+                }
+            }
+        }
+    }
+
     // ---- end of file ----
+
 }
