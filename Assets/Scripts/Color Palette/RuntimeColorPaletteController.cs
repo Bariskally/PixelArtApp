@@ -397,6 +397,34 @@ public class RuntimeColorPaletteController : MonoBehaviour
     }
 
     /// <summary>
+    /// Tüm renk slotlar?n? kald?r?p yeni paleti yükler (haz?r palet seçimi için).
+    /// </summary>
+    public void ClearAllSlotsAndAdd(List<Color32> colors)
+    {
+        if (colors == null || colors.Count == 0) return;
+
+        if (contentPanel == null || colorSlotPrefab == null)
+        {
+            EnsureCanvas();
+            EnsureScrollViewAndContent();
+            EnsureColorPickerPanel();
+            EnsureAddButton();
+        }
+
+        if (contentPanel == null) return;
+
+        for (int i = instantiatedSlots.Count - 1; i >= 0; i--)
+        {
+            if (instantiatedSlots[i] != null)
+                Destroy(instantiatedSlots[i]);
+        }
+        instantiatedSlots.Clear();
+        paletteColors.Clear();
+
+        AddColorsBulk(colors);
+    }
+
+    /// <summary>
     /// NEW: Bulk-add colors in one operation.
     /// - Prevents repeated layout rebuilds and repeated Save calls.
     /// - Safe to call before Start() finishes (colors will be queued).

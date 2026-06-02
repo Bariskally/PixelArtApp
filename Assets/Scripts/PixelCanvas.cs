@@ -56,6 +56,8 @@ public class PixelCanvas : MonoBehaviour
             }
         }
     }
+    [Header("Eyedropper")]
+    public Button eyedropperButton;
 
     [Header("History Settings")]
     public int maxHistory = 100;
