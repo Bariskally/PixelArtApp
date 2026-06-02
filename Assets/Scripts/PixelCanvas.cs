@@ -8,12 +8,13 @@ using UnityEngine.EventSystems;
 [RequireComponent(typeof(RawImage))]
 public class PixelCanvas : MonoBehaviour
 {
-    public enum Mode { Pen, Eraser, Bucket, Move, Select, Shape }
+    public enum Mode { Pen, Eraser, Bucket, Move, Select, Shape, Eyedropper }
     public enum ShapeType { None, Line, Rectangle, Circle, Triangle, Star }
 
 
 
-    Mode previousMode = Mode.Pen;  // Şekil moduna geçmeden önceki modu saklar
+    private Mode previousMode = Mode.Pen;  // Şekil moduna geçmeden önceki modu saklar
+    private Mode previousNonEyedropperMode = Mode.Pen;
     private Mode shapeDrawingMode = Mode.Pen; // Şekil çiziminde kullanılacak kalıcı mod
     [Header("Canvas size (pixels)")]
     public int width = 1024;
@@ -290,6 +291,37 @@ public class PixelCanvas : MonoBehaviour
                 dirty = false;
             }
             return;   // <-- bu return sadece Select modundayken çalışır, diğer modlara geçince atlanır
+        }
+
+        // --- Eyedropper (Pipet) ---
+        if (currentMode == Mode.Eyedropper)
+        {
+            if (ignorePointerFrames > 0) return;
+
+            // Sadece canvas üzerinde sol tık ile renk al
+            if (Input.GetMouseButtonDown(0) && IsPointerOverCanvasTexture())
+            {
+                if (TryGetMousePixel(out int px, out int py))
+                {
+                    // Tıklanan pikselin rengini al ve drawColor yap
+                    Color32 pickedColor = GetPixelColor(px, py);
+                    SetDrawColor(pickedColor); // OnDrawColorChanged event’ini de tetikler
+
+                    // Renk alındıktan sonra önceki çizim moduna geri dön
+                    if (previousNonEyedropperMode == Mode.Pen ||
+                        previousNonEyedropperMode == Mode.Eraser ||
+                        previousNonEyedropperMode == Mode.Bucket)
+                    {
+                        currentMode = previousNonEyedropperMode;
+                    }
+                    else
+                    {
+                        // Eğer önceki mod Move/Select/Shape ise varsayılan olarak Pen'e dön
+                        currentMode = Mode.Pen;
+                    }
+                }
+            }
+            return; // Eyedropper modunda başka işlem yapılmasın
         }
 
         // --- Şekil çizimi (tıkla-sürükle) ---
@@ -1668,6 +1700,15 @@ public class PixelCanvas : MonoBehaviour
         currentMode = Mode.Select;
     }
 
+
+    public void SetModeEyedropper()
+    {
+        // Eğer şu anki mod Eyedropper değilse, önceki modu sakla
+        if (currentMode != Mode.Eyedropper)
+            previousNonEyedropperMode = currentMode;
+
+        currentMode = Mode.Eyedropper;
+    }
 
     // Example ColorsEqual helper (kept)
     // (Also BeginAction/RecordChange/EndAction/Undo/Redo are present above and used by these methods.)
