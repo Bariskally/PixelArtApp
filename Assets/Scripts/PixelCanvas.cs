@@ -8,8 +8,13 @@ using UnityEngine.EventSystems;
 [RequireComponent(typeof(RawImage))]
 public class PixelCanvas : MonoBehaviour
 {
-    public enum Mode { Pen, Eraser, Bucket, Move, Select }
+    public enum Mode { Pen, Eraser, Bucket, Move, Select, Shape }
+    public enum ShapeType { None, Line, Rectangle, Circle, Triangle, Star }
 
+
+
+    Mode previousMode = Mode.Pen;  // Şekil moduna geçmeden önceki modu saklar
+    private Mode shapeDrawingMode = Mode.Pen; // Şekil çiziminde kullanılacak kalıcı mod
     [Header("Canvas size (pixels)")]
     public int width = 1024;
     public int height = 1024;
@@ -37,7 +42,19 @@ public class PixelCanvas : MonoBehaviour
     public int brushSize = 1;
 
     [Header("Runtime")]
-    public Mode currentMode = Mode.Pen;
+    private Mode _currentMode = Mode.Pen;
+    public Mode currentMode
+    {
+        get => _currentMode;
+        set
+        {
+            if (_currentMode != value)
+            {
+                _currentMode = value;
+                OnModeChanged?.Invoke(_currentMode);
+            }
+        }
+    }
 
     [Header("History Settings")]
     public int maxHistory = 100;
@@ -83,8 +100,15 @@ public class PixelCanvas : MonoBehaviour
     // Prevent clicks that originate from UI buttons (to avoid "click button then accidentally draw" bug)
     int ignorePointerFrames = 0;
 
+    // Shape drawing state
+    ShapeType currentShape = ShapeType.None;
+    bool isDrawingShape = false;
+    Vector2Int shapeStartPixel, shapeCurrentPixel;
+
     // Event: UI can subscribe to this to refresh undo/redo buttons only when history changes
     public event Action OnHistoryChanged;
+
+    public event Action<Mode> OnModeChanged;
 
     // *** YENİ EVENT: Renk değiştiğinde tetiklenir ***
     public event Action<Color32> OnDrawColorChanged;
@@ -268,6 +292,19 @@ public class PixelCanvas : MonoBehaviour
             return;   // <-- bu return sadece Select modundayken çalışır, diğer modlara geçince atlanır
         }
 
+        // --- Şekil çizimi (tıkla-sürükle) ---
+        if (currentMode == Mode.Shape && currentShape != ShapeType.None)
+        {
+            HandleShapeInput();
+            if (dirty)
+            {
+                tex.SetPixels32(pixelBuffer);
+                tex.Apply();
+                dirty = false;
+            }
+            return; // Şekil modundayken diğer çizimleri engelle
+        }
+
         // --- Pen / Eraser / Bucket (orijinal HandleInput) ---
         if (Input.GetMouseButtonDown(0) && ignorePointerFrames == 0)
         {
@@ -300,6 +337,195 @@ public class PixelCanvas : MonoBehaviour
     void NotifyHistoryChanged()
     {
         OnHistoryChanged?.Invoke();
+    }
+
+    void HandleShapeInput()
+    {
+        if (ignorePointerFrames > 0) return;
+
+        // Mouse down: başlangıç noktasını al
+        if (Input.GetMouseButtonDown(0) && IsPointerOverCanvasTexture())
+        {
+            if (TryGetMousePixel(out int px, out int py))
+            {
+                isDrawingShape = true;
+                shapeStartPixel = new Vector2Int(px, py);
+                shapeCurrentPixel = shapeStartPixel;
+                ClearShapePreviewOverlay(); // önceki önizlemeyi temizle
+            }
+            return;
+        }
+
+        // Mouse held: sürükleme devam ediyor, önizlemeyi güncelle
+        if (isDrawingShape && Input.GetMouseButton(0))
+        {
+            if (TryGetMousePixel(out int px, out int py))
+            {
+                if (shapeCurrentPixel.x != px || shapeCurrentPixel.y != py)
+                {
+                    shapeCurrentPixel = new Vector2Int(px, py);
+                    DrawShapePreview();
+                }
+            }
+            return;
+        }
+
+        // Mouse up: şekli kesin olarak çiz
+        if (isDrawingShape && Input.GetMouseButtonUp(0))
+        {
+            isDrawingShape = false;
+            // Son geçerli noktayı kullan (fare canvas dışına çıkmış olabilir)
+            if (TryGetMousePixel(out int px, out int py))
+                shapeCurrentPixel = new Vector2Int(px, py);
+
+            DrawFinalShape();
+            ClearShapePreviewOverlay();
+            // Eski mod sadece Pen veya Eraser ise ona dön, değilse Pen moduna geç
+            if (previousMode == Mode.Pen || previousMode == Mode.Eraser)
+                currentMode = previousMode;
+            else
+                currentMode = Mode.Pen;
+            currentShape = ShapeType.None;  // Sadece şekil tipini sıfırla, modu değiştirme
+        }
+    }
+
+    void ClearShapePreviewOverlay()
+    {
+        // Seçim overlay'ini kullanarak önizleme yapacağız. 
+        // DİKKAT: Bu, selection overlay'ini sıfırlar. Eğer ayrı bir overlay isterseniz ayrı texture oluşturabiliriz.
+        Color32[] clear = new Color32[width * height];
+        for (int i = 0; i < clear.Length; i++) clear[i] = new Color32(0, 0, 0, 0);
+        overlayTex.SetPixels32(clear);
+        overlayTex.Apply();
+    }
+
+    void DrawShapePreview()
+    {
+        ClearShapePreviewOverlay();
+        int x1 = shapeStartPixel.x, y1 = shapeStartPixel.y;
+        int x2 = shapeCurrentPixel.x, y2 = shapeCurrentPixel.y;
+
+        // Önizleme rengi: Pen modunda drawColor'ın yarı saydamı, Eraser modunda arka plan renginin yarı saydamı
+        Color32 previewColor;
+        if (shapeDrawingMode == Mode.Pen)
+            previewColor = new Color32(drawColor.r, drawColor.g, drawColor.b, 255);
+        else
+        {
+            Color32 bg = GetBackgroundColorAt(x1, y1);
+            previewColor = new Color32(bg.r, bg.g, bg.b, 255);
+        }
+
+        switch (currentShape)
+        {
+            case ShapeType.Line:
+                DrawLineOnOverlay(x1, y1, x2, y2, previewColor);
+                break;
+            case ShapeType.Rectangle:
+                DrawHollowRectOnOverlay(x1, y1, x2, y2, previewColor);
+                break;
+            case ShapeType.Circle:
+                int cx = (x1 + x2) / 2;
+                int cy = (y1 + y2) / 2;
+                int radius = Mathf.Max(Mathf.Abs(x2 - x1), Mathf.Abs(y2 - y1)) / 2;
+                if (radius < 1) radius = 1;
+                DrawHollowCircleOnOverlay(cx, cy, radius, previewColor);
+                break;
+            case ShapeType.Triangle:
+                DrawHollowTriangleOnOverlay(x1, y1, x2, y2, previewColor);
+                break;
+            case ShapeType.Star:
+                DrawHollowStarOnOverlay(x1, y1, x2, y2, previewColor);
+                break;
+        }
+        overlayTex.Apply();
+    }
+
+
+    void DrawFinalShape()
+    {
+        int x1 = shapeStartPixel.x, y1 = shapeStartPixel.y;
+        int x2 = shapeCurrentPixel.x, y2 = shapeCurrentPixel.y;
+        Color32 col = (shapeDrawingMode == Mode.Pen) ? drawColor : GetBackgroundColorAt(x1, y1);
+
+        BeginAction();
+
+        switch (currentShape)
+        {
+            case ShapeType.Line:
+                DrawLineImmediate(x1, y1, x2, y2, col);
+                break;
+            case ShapeType.Rectangle:
+                DrawHollowRectFromCorners(x1, y1, x2, y2, col);
+                break;
+            case ShapeType.Circle:
+                DrawHollowCircleFromCorners(x1, y1, x2, y2, col);
+                break;
+            case ShapeType.Triangle:
+                DrawHollowTriangleFromCorners(x1, y1, x2, y2, col);
+                break;
+            case ShapeType.Star:
+                DrawHollowStarFromCorners(x1, y1, x2, y2, col);
+                break;
+        }
+
+        EndAction();
+        dirty = true;
+    }
+
+    // Aşağıdaki metotlar, iki köşe noktasından içi boş şekil çizer
+    void DrawHollowRectFromCorners(int x1, int y1, int x2, int y2, Color32 color)
+    {
+        int xMin = Mathf.Min(x1, x2), xMax = Mathf.Max(x1, x2);
+        int yMin = Mathf.Min(y1, y2), yMax = Mathf.Max(y1, y2);
+        // Kenarlar
+        for (int x = xMin; x <= xMax; x++)
+        {
+            if (x >= 0 && x < width)
+            {
+                if (yMin >= 0 && yMin < height) DrawPixelRecord(yMin * width + x, color);
+                if (yMax >= 0 && yMax < height && yMax != yMin) DrawPixelRecord(yMax * width + x, color);
+            }
+        }
+        for (int y = yMin + 1; y <= yMax - 1; y++)
+        {
+            if (y >= 0 && y < height)
+            {
+                if (xMin >= 0 && xMin < width) DrawPixelRecord(y * width + xMin, color);
+                if (xMax >= 0 && xMax < width) DrawPixelRecord(y * width + xMax, color);
+            }
+        }
+    }
+
+    void DrawHollowCircleFromCorners(int x1, int y1, int x2, int y2, Color32 color)
+    {
+        int cx = (x1 + x2) / 2;
+        int cy = (y1 + y2) / 2;
+        int radius = Mathf.Max(Mathf.Abs(x2 - x1), Mathf.Abs(y2 - y1)) / 2;
+        if (radius < 1) radius = 1;
+        DrawHollowCircleImmediate(cx, cy, radius, color);
+    }
+
+    void DrawHollowTriangleFromCorners(int x1, int y1, int x2, int y2, Color32 color)
+    {
+        int topX = (x1 + x2) / 2;
+        int topY = Mathf.Min(y1, y2);
+        int bottomLeftX = Mathf.Min(x1, x2);
+        int bottomRightX = Mathf.Max(x1, x2);
+        int bottomY = Mathf.Max(y1, y2);
+
+        DrawLineRecord(topX, topY, bottomLeftX, bottomY, color);
+        DrawLineRecord(topX, topY, bottomRightX, bottomY, color);
+        DrawLineRecord(bottomLeftX, bottomY, bottomRightX, bottomY, color);
+    }
+
+    void DrawHollowStarFromCorners(int x1, int y1, int x2, int y2, Color32 color)
+    {
+        int cx = (x1 + x2) / 2;
+        int cy = (y1 + y2) / 2;
+        int outerRadius = Mathf.Max(Mathf.Abs(x2 - x1), Mathf.Abs(y2 - y1)) / 2;
+        if (outerRadius < 2) outerRadius = 2;
+        int innerRadius = outerRadius / 2;
+        DrawHollowStarImmediate(cx, cy, outerRadius, innerRadius, color);
     }
 
     bool IsPointerOverCanvasTexture()
@@ -1969,6 +2195,362 @@ public class PixelCanvas : MonoBehaviour
         }
     }
 
+    // ==================== İÇİ BOŞ ŞEKİL ÇİZME METODLARI ====================
+
+    /// <summary>İçi boş kare (sadece kenar)</summary>
+    public void DrawHollowRectImmediate(int centerX, int centerY, int halfSize, Color32 color)
+    {
+        int xMin = centerX - halfSize;
+        int xMax = centerX + halfSize;
+        int yMin = centerY - halfSize;
+        int yMax = centerY + halfSize;
+
+        BeginAction();
+        // Üst ve alt kenar
+        for (int x = xMin; x <= xMax; x++)
+        {
+            if (x >= 0 && x < width)
+            {
+                if (yMin >= 0 && yMin < height)
+                    DrawPixelRecord(yMin * width + x, color);
+                if (yMax >= 0 && yMax < height && yMax != yMin)
+                    DrawPixelRecord(yMax * width + x, color);
+            }
+        }
+        // Sol ve sağ kenar (köşeler hariç)
+        for (int y = yMin + 1; y <= yMax - 1; y++)
+        {
+            if (y >= 0 && y < height)
+            {
+                if (xMin >= 0 && xMin < width)
+                    DrawPixelRecord(y * width + xMin, color);
+                if (xMax >= 0 && xMax < width)
+                    DrawPixelRecord(y * width + xMax, color);
+            }
+        }
+        EndAction();
+        dirty = true;
+    }
+
+    /// <summary>İçi boş daire (sadece kenar) - Bresenham algoritması</summary>
+    public void DrawHollowCircleImmediate(int cx, int cy, int radius, Color32 color)
+    {
+        if (radius <= 0) return;
+        BeginAction();
+        int x = radius, y = 0;
+        int err = 0;
+        while (x >= y)
+        {
+            DrawPixelRecord(GetIndex(cx + x, cy + y), color);
+            DrawPixelRecord(GetIndex(cx - x, cy + y), color);
+            DrawPixelRecord(GetIndex(cx + x, cy - y), color);
+            DrawPixelRecord(GetIndex(cx - x, cy - y), color);
+            DrawPixelRecord(GetIndex(cx + y, cy + x), color);
+            DrawPixelRecord(GetIndex(cx - y, cy + x), color);
+            DrawPixelRecord(GetIndex(cx + y, cy - x), color);
+            DrawPixelRecord(GetIndex(cx - y, cy - x), color);
+
+            y++;
+            err += 1 + 2 * y;
+            if (2 * (err - x) + 1 > 0) { x--; err += 1 - 2 * x; }
+        }
+        EndAction();
+        dirty = true;
+    }
+
+    /// <summary>İçi boş üçgen (eşkenar, tepe yukarı)</summary>
+    public void DrawHollowTriangleImmediate(int centerX, int centerY, int size, Color32 color)
+    {
+        int halfSize = size / 2;
+        int topX = centerX, topY = centerY - halfSize;
+        int bottomLeftX = centerX - halfSize, bottomY = centerY + halfSize;
+        int bottomRightX = centerX + halfSize;
+
+        BeginAction();
+        DrawLineRecord(topX, topY, bottomLeftX, bottomY, color);
+        DrawLineRecord(topX, topY, bottomRightX, bottomY, color);
+        DrawLineRecord(bottomLeftX, bottomY, bottomRightX, bottomY, color);
+        EndAction();
+        dirty = true;
+    }
+
+    /// <summary>İçi boş 5 köşeli yıldız</summary>
+    public void DrawHollowStarImmediate(int centerX, int centerY, int outerRadius, int innerRadius, Color32 color)
+    {
+        List<Vector2Int> points = new List<Vector2Int>();
+        for (int i = 0; i < 10; i++)
+        {
+            float angle = i * 36 * Mathf.Deg2Rad;
+            int r = (i % 2 == 0) ? outerRadius : innerRadius;
+            int x = centerX + Mathf.RoundToInt(r * Mathf.Sin(angle));
+            int y = centerY + Mathf.RoundToInt(r * Mathf.Cos(angle));
+            points.Add(new Vector2Int(x, y));
+        }
+        BeginAction();
+        for (int i = 0; i < points.Count; i++)
+        {
+            Vector2Int p1 = points[i];
+            Vector2Int p2 = points[(i + 1) % points.Count];
+            DrawLineRecord(p1.x, p1.y, p2.x, p2.y, color);
+        }
+        EndAction();
+        dirty = true;
+    }
+
+    // ==================== YARDIMCI METODLAR ====================
+
+    private int GetIndex(int x, int y)
+    {
+        if (x < 0 || x >= width || y < 0 || y >= height) return -1;
+        return y * width + x;
+    }
+
+    private void DrawPixelRecord(int idx, Color32 color)
+    {
+        if (idx < 0 || idx >= pixelBuffer.Length) return;
+        Color32 prev = pixelBuffer[idx];
+        if (!ColorsEqual(prev, color))
+        {
+            pixelBuffer[idx] = color;
+            RecordChange(idx, prev, color);
+            dirty = true;
+        }
+    }
+
+    private void DrawLineRecord(int x0, int y0, int x1, int y1, Color32 color)
+    {
+        int dx = Math.Abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+        int dy = -Math.Abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+        int err = dx + dy;
+        int x = x0, y = y0;
+        while (true)
+        {
+            int idx = GetIndex(x, y);
+            if (idx != -1) DrawPixelRecord(idx, color);
+            if (x == x1 && y == y1) break;
+            int e2 = 2 * err;
+            if (e2 >= dy) { err += dy; x += sx; }
+            if (e2 <= dx) { err += dx; y += sy; }
+        }
+    }
+
+    // ==================== BUTONLARIN ÇAĞIRACAĞI PUBLIC METODLAR ====================
+
+    /// <summary>Çizgi çizer (Pen modunda drawColor, Eraser modunda arka plan rengi)</summary>
+    public void DrawShapeLine()
+    {
+        if (!TryGetMousePixel(out int x, out int y)) { x = width / 2; y = height / 2; }
+        int endX = Mathf.Min(x + 30, width - 1);
+        Color32 col = (currentMode == Mode.Pen) ? drawColor : GetBackgroundColorAt(x, y);
+
+        if (currentMode == Mode.Pen)
+            DrawLineImmediate(x, y, endX, y, col);
+        else
+        {
+            BeginAction();
+            for (int xi = x; xi <= endX; xi++)
+                DrawPixelRecord(y * width + xi, GetBackgroundColorAt(xi, y));
+            EndAction();
+            dirty = true;
+        }
+    }
+
+    /// <summary>İçi boş kare çizer</summary>
+    public void DrawShapeSquare()
+    {
+        if (!TryGetMousePixel(out int x, out int y)) { x = width / 2; y = height / 2; }
+        Color32 col = (currentMode == Mode.Pen) ? drawColor : GetBackgroundColorAt(x, y);
+        DrawHollowRectImmediate(x, y, 20, col);
+    }
+
+    /// <summary>İçi boş daire çizer</summary>
+    public void DrawShapeCircle()
+    {
+        if (!TryGetMousePixel(out int x, out int y)) { x = width / 2; y = height / 2; }
+        Color32 col = (currentMode == Mode.Pen) ? drawColor : GetBackgroundColorAt(x, y);
+        DrawHollowCircleImmediate(x, y, 20, col);
+    }
+
+    /// <summary>İçi boş üçgen çizer</summary>
+    public void DrawShapeTriangle()
+    {
+        if (!TryGetMousePixel(out int x, out int y)) { x = width / 2; y = height / 2; }
+        Color32 col = (currentMode == Mode.Pen) ? drawColor : GetBackgroundColorAt(x, y);
+        DrawHollowTriangleImmediate(x, y, 40, col);
+    }
+
+    /// <summary>İçi boş yıldız çizer</summary>
+    public void DrawShapeStar()
+    {
+        if (!TryGetMousePixel(out int x, out int y)) { x = width / 2; y = height / 2; }
+        Color32 col = (currentMode == Mode.Pen) ? drawColor : GetBackgroundColorAt(x, y);
+        DrawHollowStarImmediate(x, y, 25, 12, col);
+    }
+
+    // ==================== ŞEKİL MODUNU BAŞLATAN METOTLAR (BUTONLAR BUNLARI ÇAĞIRACAK) ====================
+    public void StartShapeLine()
+    {
+        // Sadece Pen veya Eraser modunda çizim modunu güncelle
+        if (currentMode == Mode.Pen || currentMode == Mode.Eraser)
+        {
+            shapeDrawingMode = currentMode;
+            previousMode = currentMode;
+        }
+        // Diğer modlarda (Select, Move, Bucket) shapeDrawingMode ve previousMode değişmez
+        // (en son kullanılan Pen/Eraser değeri kalır)
+        currentMode = Mode.Shape;
+        currentShape = ShapeType.Line;
+        IgnorePointerForOneFrame();
+    }
+
+    public void StartShapeRect()
+    {
+        if (currentMode == Mode.Pen || currentMode == Mode.Eraser)
+        {
+            shapeDrawingMode = currentMode;
+            previousMode = currentMode;
+        }
+        currentMode = Mode.Shape;
+        currentShape = ShapeType.Rectangle;
+        IgnorePointerForOneFrame();
+    }
+    public void StartShapeCircle()
+    {
+        if (currentMode == Mode.Pen || currentMode == Mode.Eraser)
+        {
+            shapeDrawingMode = currentMode;
+            previousMode = currentMode;
+        }
+        currentMode = Mode.Shape;
+        currentShape = ShapeType.Circle;
+        IgnorePointerForOneFrame();
+    }
+    public void StartShapeTriangle()
+    {
+        if (currentMode == Mode.Pen || currentMode == Mode.Eraser)
+        {
+            shapeDrawingMode = currentMode;
+            previousMode = currentMode;
+        }
+        currentMode = Mode.Shape;
+        currentShape = ShapeType.Triangle;
+        IgnorePointerForOneFrame();
+    }
+    public void StartShapeStar()
+    {
+        if (currentMode == Mode.Pen || currentMode == Mode.Eraser)
+        {
+            shapeDrawingMode = currentMode;
+            previousMode = currentMode;
+        }
+        currentMode = Mode.Shape;
+        currentShape = ShapeType.Star;
+        IgnorePointerForOneFrame();
+    }
+
+
+    // ==================== OVERLAY ŞEKİL ÇİZİM METOTLARI (ÖNİZLEME İÇİN) ====================
+
+    void DrawHollowRectOnOverlay(int x1, int y1, int x2, int y2, Color32 color)
+    {
+        int xMin = Mathf.Min(x1, x2), xMax = Mathf.Max(x1, x2);
+        int yMin = Mathf.Min(y1, y2), yMax = Mathf.Max(y1, y2);
+        for (int x = xMin; x <= xMax; x++)
+        {
+            if (x >= 0 && x < width)
+            {
+                if (yMin >= 0 && yMin < height) overlayTex.SetPixel(x, yMin, color);
+                if (yMax >= 0 && yMax < height && yMax != yMin) overlayTex.SetPixel(x, yMax, color);
+            }
+        }
+        for (int y = yMin + 1; y <= yMax - 1; y++)
+        {
+            if (y >= 0 && y < height)
+            {
+                if (xMin >= 0 && xMin < width) overlayTex.SetPixel(xMin, y, color);
+                if (xMax >= 0 && xMax < width) overlayTex.SetPixel(xMax, y, color);
+            }
+        }
+    }
+
+    void DrawHollowCircleOnOverlay(int cx, int cy, int radius, Color32 color)
+    {
+        if (radius <= 0) return;
+        int x = radius, y = 0;
+        int err = 0;
+        while (x >= y)
+        {
+            SetOverlayPixelSafe(cx + x, cy + y, color);
+            SetOverlayPixelSafe(cx - x, cy + y, color);
+            SetOverlayPixelSafe(cx + x, cy - y, color);
+            SetOverlayPixelSafe(cx - x, cy - y, color);
+            SetOverlayPixelSafe(cx + y, cy + x, color);
+            SetOverlayPixelSafe(cx - y, cy + x, color);
+            SetOverlayPixelSafe(cx + y, cy - x, color);
+            SetOverlayPixelSafe(cx - y, cy - x, color);
+            y++;
+            err += 1 + 2 * y;
+            if (2 * (err - x) + 1 > 0) { x--; err += 1 - 2 * x; }
+        }
+    }
+
+    void DrawHollowTriangleOnOverlay(int x1, int y1, int x2, int y2, Color32 color)
+    {
+        int topX = (x1 + x2) / 2;
+        int topY = Mathf.Min(y1, y2);
+        int bottomLeftX = Mathf.Min(x1, x2);
+        int bottomRightX = Mathf.Max(x1, x2);
+        int bottomY = Mathf.Max(y1, y2);
+        DrawLineOnOverlay(topX, topY, bottomLeftX, bottomY, color);
+        DrawLineOnOverlay(topX, topY, bottomRightX, bottomY, color);
+        DrawLineOnOverlay(bottomLeftX, bottomY, bottomRightX, bottomY, color);
+    }
+
+    void DrawHollowStarOnOverlay(int x1, int y1, int x2, int y2, Color32 color)
+    {
+        int cx = (x1 + x2) / 2;
+        int cy = (y1 + y2) / 2;
+        int outerRadius = Mathf.Max(Mathf.Abs(x2 - x1), Mathf.Abs(y2 - y1)) / 2;
+        if (outerRadius < 2) outerRadius = 2;
+        int innerRadius = outerRadius / 2;
+        List<Vector2Int> points = new List<Vector2Int>();
+        for (int i = 0; i < 10; i++)
+        {
+            float angle = i * 36 * Mathf.Deg2Rad;
+            int r = (i % 2 == 0) ? outerRadius : innerRadius;
+            int x = cx + Mathf.RoundToInt(r * Mathf.Sin(angle));
+            int y = cy + Mathf.RoundToInt(r * Mathf.Cos(angle));
+            points.Add(new Vector2Int(x, y));
+        }
+        for (int i = 0; i < points.Count; i++)
+        {
+            Vector2Int p1 = points[i];
+            Vector2Int p2 = points[(i + 1) % points.Count];
+            DrawLineOnOverlay(p1.x, p1.y, p2.x, p2.y, color);
+        }
+    }
+
+    void DrawLineOnOverlay(int x0, int y0, int x1, int y1, Color32 color)
+    {
+        int dx = Math.Abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+        int dy = -Math.Abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+        int err = dx + dy;
+        int x = x0, y = y0;
+        while (true)
+        {
+            SetOverlayPixelSafe(x, y, color);
+            if (x == x1 && y == y1) break;
+            int e2 = 2 * err;
+            if (e2 >= dy) { err += dy; x += sx; }
+            if (e2 <= dx) { err += dx; y += sy; }
+        }
+    }
+
+    void SetOverlayPixelSafe(int x, int y, Color32 color)
+    {
+        if (x >= 0 && x < width && y >= 0 && y < height)
+            overlayTex.SetPixel(x, y, color);
+    }
     // ---- end of file ----
 
 }
